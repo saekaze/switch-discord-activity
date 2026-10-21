@@ -1,0 +1,39 @@
+name: Release
+
+# Push a tag like v1.0.0 (matching SWITCHRPC_VERSION in include/config.h):
+# CI builds the SD card zip and publishes a GitHub release with it.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkita64:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Portlibs
+        run: dkp-pacman -Sy --noconfirm --needed switch-curl switch-libjson-c switch-sdl2 switch-sdl2_ttf switch-sdl2_image
+
+      - name: Check the tag matches the version
+        run: |
+          v=$(sed -n 's/.*SWITCHRPC_VERSION "\(.*\)"/\1/p' include/config.h)
+          [ "v$v" = "${GITHUB_REF_NAME}" ] || { echo "tag ${GITHUB_REF_NAME} != v$v in include/config.h"; exit 1; }
+
+      - name: Build
+        run: make dist
+
+      - name: Release notes from CHANGELOG.md
+        run: |
+          v=${GITHUB_REF_NAME#v}
+          awk -v v="$v" '$0 ~ "^## \\[?"v"\\]?" {on=1; next} /^## / && on {exit} on' CHANGELOG.md > notes.md
+          [ -s notes.md ] || echo "Switch Discord Activity ${GITHUB_REF_NAME}" > notes.md
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: out/switch-discord-activity-*.zip
+          body_path: notes.md

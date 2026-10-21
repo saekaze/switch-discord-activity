@@ -1,0 +1,1208 @@
+// Switch Discord Activity app (.nro) - one-time Discord login.
+//
+// Log in once: scan the QR code with your phone, approve in Discord, done.
+// The refresh token is saved to sdmc:/config/switchrpc_token and the
+// background sysmodule keeps your status up to date on its own from then on.
+//
+// The login flow is the one from llsc12/SwitchRPC (MIT): Discord Social SDK
+// OAuth2 with PKCE, bounced through static.llsc12.me back to this console.
+
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <sys/stat.h>
+#include <dirent.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <switch.h>
+#include <curl/curl.h>
+#include <json-c/json.h>
+#include <json-c/json_util.h>
+#include "config.h"
+#include "qrcodegen.h"
+#include "ui.h"
+
+#define SYSMODULE_ID  SYSMODULE_TID
+#define TOKEN_PATH    "sdmc:/config/switchrpc_token"
+#define USER_PATH     "sdmc:/config/switchrpc_user"
+#define LOG_PATH      "sdmc:/switchrpc_log.txt"
+#define STATUS_PATH   "sdmc:/config/switchrpc_status"
+#define MODULE_DIR    "sdmc:/atmosphere/contents/3120000000000092"
+// the earlier PC-based version of this project ("Switch Discord RPC")
+#define OLD_MODULE    "sdmc:/atmosphere/contents/420000000000D15C"
+#define OLD_NRO       "sdmc:/switch/switch-rpc.nro"
+#define LOGIN_PORT    45601
+#define CLIENT_ID     DISCORD_CLIENT_ID
+#define REDIRECT_URI  AUTH_SHIM
+#define SCOPE         "openid sdk.social_layer_presence"
+
+
+// --- small helpers ----------------------------------------------------------
+
+static void b64url(const u8 *in, size_t len, char *out) {
+    static const char tbl[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    size_t o = 0;
+    for (size_t i = 0; i < len; i += 3) {
+        u32 v = in[i] << 16;
+        if (i + 1 < len) v |= in[i + 1] << 8;
+        if (i + 2 < len) v |= in[i + 2];
+        out[o++] = tbl[(v >> 18) & 63];
+        out[o++] = tbl[(v >> 12) & 63];
+        if (i + 1 < len) out[o++] = tbl[(v >> 6) & 63];
+        if (i + 2 < len) out[o++] = tbl[v & 63];
+    }
+    out[o] = '\0';
+}
+
+static void urlencode(const char *in, char *out, size_t out_size) {
+    size_t o = 0;
+    for (; *in && o + 4 < out_size; in++) {
+        unsigned char c = *in;
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+            c == '-' || c == '_' || c == '.' || c == '~') {
+            out[o++] = c;
+        } else {
+            o += snprintf(out + o, out_size - o, "%%%02X", c);
+        }
+    }
+    out[o] = '\0';
+}
+
+// rm -r
+static void remove_tree(const char *path) {
+    DIR *dir = opendir(path);
+    if (dir) {
+        struct dirent *e;
+        while ((e = readdir(dir))) {
+            if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, ".."))
+                continue;
+            char child[512];
+            snprintf(child, sizeof(child), "%s/%s", path, e->d_name);
+            remove_tree(child);
+        }
+        closedir(dir);
+        rmdir(path);
+    } else {
+        remove(path);
+    }
+}
+
+static bool file_exists(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0 && st.st_size > 0;
+}
+
+static bool sysmodule_running(void) {
+    u64 pid = 0;
+    return R_SUCCEEDED(pmdmntGetProcessId(&pid, SYSMODULE_ID));
+}
+
+static bool get_ip(char *out, size_t size) {
+    u32 ip = 0;
+    if (R_FAILED(nifmGetCurrentIpAddress(&ip)) || ip == 0)
+        return false;
+    snprintf(out, size, "%u.%u.%u.%u", ip & 0xFF, (ip >> 8) & 0xFF, (ip >> 16) & 0xFF, ip >> 24);
+    return true;
+}
+
+// QR code as a size*size grid (nonzero = dark), for ui_login
+static int make_qr(const char *text, uint8_t *grid, int max) {
+    uint8_t qr[qrcodegen_BUFFER_LEN_FOR_VERSION(5)];
+    uint8_t tmp[qrcodegen_BUFFER_LEN_FOR_VERSION(5)];
+    if (!qrcodegen_encodeText(text, tmp, qr, qrcodegen_Ecc_LOW, 1, 5, qrcodegen_Mask_AUTO, true))
+        return 0;
+    int size = qrcodegen_getSize(qr);
+    if (size > max) return 0;
+    for (int y = 0; y < size; y++)
+        for (int x = 0; x < size; x++)
+            grid[y * size + x] = qrcodegen_getModule(qr, x, y);
+    return size;
+}
+
+// --- HTTPS (Discord) --------------------------------------------------------
+
+static size_t collect(char *ptr, size_t size, size_t nmemb, void *userdata) {
+    char **buf = userdata;
+    size_t old = *buf ? strlen(*buf) : 0, add = size * nmemb;
+    char *n = realloc(*buf, old + add + 1);
+    if (!n) return 0;
+    memcpy(n + old, ptr, add);
+    n[old + add] = '\0';
+    *buf = n;
+    return add;
+}
+
+// Returns the parsed JSON body of a 2xx response, or NULL.
+static json_object *http_json(const char *url, const char *post_body, const char *bearer) {
+    CURL *curl = curl_easy_init();
+    if (!curl) return NULL;
+    char *body = NULL;
+    struct curl_slist *headers = curl_slist_append(NULL, "Accept: application/json");
+    char auth[1024];
+    if (bearer) {
+        snprintf(auth, sizeof(auth), "Authorization: Bearer %s", bearer);
+        headers = curl_slist_append(headers, auth);
+    }
+    if (post_body) {
+        headers = curl_slist_append(headers, "Content-Type: application/x-www-form-urlencoded");
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_body);
+    }
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    // same as the sysmodule: the console's CA store can't verify these hosts
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 20L);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, collect);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
+
+    json_object *out = NULL;
+    long code = 0;
+    if (curl_easy_perform(curl) == CURLE_OK) {
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+        if (code >= 200 && code < 300 && body)
+            out = json_tokener_parse(body);
+    }
+    free(body);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    return out;
+}
+
+static const char *jstr(json_object *o, const char *key) {
+    json_object *v;
+    return (o && json_object_object_get_ex(o, key, &v)) ? json_object_get_string(v) : NULL;
+}
+
+// --- login web server ------------------------------------------------------
+
+typedef struct {
+    int fd;
+    char verifier[96];
+    char challenge[48];
+    char state[40];
+    char ip[16];
+    char code[256];
+    bool got_code;
+} Login;
+
+static void send_str(int fd, const char *s) {
+    size_t n = strlen(s);
+    while (n) {
+        ssize_t w = send(fd, s, n, 0);
+        if (w <= 0) return;
+        s += w; n -= w;
+    }
+}
+
+static void query_param(const char *query, const char *key, char *out, size_t size) {
+    out[0] = '\0';
+    size_t klen = strlen(key);
+    for (const char *p = query; p && *p; ) {
+        if (!strncmp(p, key, klen) && p[klen] == '=') {
+            p += klen + 1;
+            size_t i = 0;
+            while (*p && *p != '&' && *p != ' ' && i + 1 < size)
+                out[i++] = *p++;
+            out[i] = '\0';
+            return;
+        }
+        p = strchr(p, '&');
+        if (p) p++;
+    }
+}
+
+static void serve_one(Login *lg, int c) {
+    struct timeval tv = { .tv_sec = 2 };
+    setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    char req[4096];
+    ssize_t n = recv(c, req, sizeof(req) - 1, 0);
+    if (n <= 0) return;
+    req[n] = '\0';
+
+    // "GET /path?query HTTP/1.1"
+    char *path = strchr(req, ' ');
+    if (!path) return;
+    path++;
+    char *end = strchr(path, ' ');
+    if (end) *end = '\0';
+    char *query = strchr(path, '?');
+    if (query) *query++ = '\0';
+
+    static char resp[4096];
+    if (!strcmp(path, "/callback") && query) {
+        char state[64];
+        query_param(query, "state", state, sizeof(state));
+        query_param(query, "code", lg->code, sizeof(lg->code));
+        if (lg->code[0] && !strcmp(state, lg->state)) {
+            lg->got_code = true;
+            send_str(c, "HTTP/1.1 302 Found\r\nLocation: " AUTH_SHIM "/complete\r\n"
+                        "Content-Length: 0\r\nConnection: close\r\n\r\n");
+        } else {
+            send_str(c, "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n"
+                        "Login link expired - start the login again on the Switch.");
+        }
+        return;
+    }
+
+    if (!strcmp(path, "/")) {
+        char auth[1024], auth_enc[1536], redirect_enc[128], scope_enc[96];
+        urlencode(REDIRECT_URI, redirect_enc, sizeof(redirect_enc));
+        urlencode(SCOPE, scope_enc, sizeof(scope_enc));
+        snprintf(auth, sizeof(auth),
+                 "https://discord.com/oauth2/authorize?client_id=" CLIENT_ID
+                 "&response_type=code&scope=%s&code_challenge=%s&code_challenge_method=S256"
+                 "&state=%s&redirect_uri=%s",
+                 scope_enc, lg->challenge, lg->state, redirect_enc);
+        urlencode(auth, auth_enc, sizeof(auth_enc));
+        snprintf(resp, sizeof(resp),
+                 "HTTP/1.1 302 Found\r\nLocation: " AUTH_SHIM "?ip=%s&auth=%s\r\n"
+                 "Content-Length: 0\r\nConnection: close\r\n\r\n",
+                 lg->ip, auth_enc);
+        send_str(c, resp);
+        return;
+    }
+
+    send_str(c, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+}
+
+static bool login_start(Login *lg) {
+    memset(lg, 0, sizeof(*lg));
+    lg->fd = -1;
+    if (!get_ip(lg->ip, sizeof(lg->ip)))
+        return false;
+
+    // PKCE
+    u8 rnd[64], hash[32], st[16];
+    randomGet(rnd, sizeof(rnd));
+    b64url(rnd, sizeof(rnd), lg->verifier);
+    sha256CalculateHash(hash, lg->verifier, strlen(lg->verifier));
+    b64url(hash, sizeof(hash), lg->challenge);
+    randomGet(st, sizeof(st));
+    for (int i = 0; i < 16; i++)
+        sprintf(lg->state + i * 2, "%02x", st[i]);
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return false;
+    int yes = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(LOGIN_PORT),
+                                .sin_addr.s_addr = htonl(INADDR_ANY) };
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 || listen(fd, 4) < 0) {
+        close(fd);
+        return false;
+    }
+    lg->fd = fd;
+    return true;
+}
+
+static void login_poll(Login *lg) {
+    struct pollfd p = { .fd = lg->fd, .events = POLLIN };
+    if (poll(&p, 1, 0) > 0 && (p.revents & POLLIN)) {
+        int c = accept(lg->fd, NULL, NULL);
+        if (c >= 0) {
+            serve_one(lg, c);
+            close(c);
+        }
+    }
+}
+
+static void login_stop(Login *lg) {
+    if (lg->fd >= 0) close(lg->fd);
+    lg->fd = -1;
+}
+
+// Swaps the code for tokens and stores the refresh token. Returns the
+// Discord username on success.
+static bool login_finish(Login *lg, char *user, size_t user_size) {
+    char redirect_enc[128], body[1024];
+    urlencode(REDIRECT_URI, redirect_enc, sizeof(redirect_enc));
+    snprintf(body, sizeof(body),
+             "grant_type=authorization_code&redirect_uri=%s&client_id=" CLIENT_ID "&code=%s&code_verifier=%s",
+             redirect_enc, lg->code, lg->verifier);
+
+    json_object *tok = http_json("https://gaming-sdk.com/api/v9/oauth2/token", body, NULL);
+    const char *refresh = jstr(tok, "refresh_token"), *access = jstr(tok, "access_token");
+    if (!refresh || !access) {
+        json_object_put(tok);
+        return false;
+    }
+
+    mkdir("sdmc:/config", 0777);
+    FILE *f = fopen(TOKEN_PATH, "w");
+    if (!f) {
+        json_object_put(tok);
+        return false;
+    }
+    fputs(refresh, f);
+    fclose(f);
+
+    snprintf(user, user_size, "your account");
+    json_object *me = http_json("https://gaming-sdk.com/api/v9/oauth2/@me", NULL, access);
+    json_object *u;
+    if (me && json_object_object_get_ex(me, "user", &u)) {
+        const char *name = jstr(u, "global_name");
+        if (!name) name = jstr(u, "username");
+        if (name) snprintf(user, user_size, "%s", name);
+    }
+    json_object_put(me);
+    json_object_put(tok);
+    FILE *uf = fopen(USER_PATH, "w");
+    if (uf) { fputs(user, uf); fclose(uf); }
+    return true;
+}
+
+// --- UI ------------------------------------------------------------------------
+
+typedef enum { Screen_Main, Screen_Login, Screen_Test, Screen_Icons, Screen_Diag } Screen;
+
+typedef struct {
+    char fw[32], ams[32];
+    bool on_sd, running, logged_in, online;
+    char user[64];
+    char launch[80];       // result of the last "start module" attempt
+    const char *status_color;
+    char status[200];      // what the module is doing right now (plain text)
+    char status_state[16]; // live / idle / error / login / off, from the status file
+    char status_raw[160];  // the module's text as is
+    bool status_fresh;     // module wrote its status file recently = it's alive
+    char icon[200];        // image URL the module sent to Discord
+    long long clock_off;   // real time minus console clock, seconds
+    bool have_clock;
+    char log[20][80];
+    int log_lines;
+} Diag;
+
+static void read_line_file(const char *path, char *out, size_t size) {
+    out[0] = '\0';
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    if (fgets(out, size, f))
+        out[strcspn(out, "\r\n")] = '\0';
+    fclose(f);
+}
+
+static bool interesting(const char *line) {
+    // the module logs every HTTP header; keep the lines that mean something
+    return !strstr(line, "[cURL") && !strstr(line, "Response Body") && !strstr(line, "Request Body") &&
+           !strstr(line, "Response length") && !strstr(line, "(No response expected)") &&
+           !strstr(line, "Including session token") && line[0];
+}
+
+static void read_log(Diag *d) {
+    d->log_lines = 0;
+    d->status_color = "\x1b[33m";
+    snprintf(d->status, sizeof(d->status), "Module hasn't written a log yet (is it running?)");
+    FILE *f = fopen(LOG_PATH, "r");
+    if (!f) return;
+
+    // only the tail matters
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, size > 16384 ? size - 16384 : 0, SEEK_SET);
+    if (size > 16384) { char skip[512]; fgets(skip, sizeof(skip), f); }
+
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        // "[hh:mm:ss] message" -> one-line status from the latest meaningful event
+        const char *msg = strchr(line, ']') ? strchr(line, ']') + 2 : line;
+        if (strstr(line, "Status is live")) {
+            d->status_color = "\x1b[32m";
+            snprintf(d->status, sizeof(d->status), "%.190s", msg);
+        } else if (strstr(line, "Clearing") || strstr(line, "Sleep imminent")) {
+            d->status_color = "";
+            snprintf(d->status, sizeof(d->status), "No game running - status cleared. Start a game, wait ~10 s.");
+        } else if (strstr(line, "Not logged in yet") || strstr(line, "Refresh token is empty")) {
+            d->status_color = "\x1b[33m";
+            snprintf(d->status, sizeof(d->status), "Not logged in - press A.");
+        } else if (strstr(line, "HTTP 4") || strstr(line, "Failed") || strstr(line, "failed")) {
+            d->status_color = "\x1b[31m";
+            snprintf(d->status, sizeof(d->status), "%.190s", msg);
+        } else if (strstr(line, "Sysmodule started")) {
+            d->status_color = "";
+            snprintf(d->status, sizeof(d->status), "Module started. Start a game and wait ~10 s.");
+        }
+
+        if (!interesting(line))
+            continue;
+        // wrap instead of cutting: the reason for an error is at the end
+        for (size_t off = 0, len = strlen(line); off < len; off += 74) {
+            if (d->log_lines == 20) {
+                memmove(d->log[0], d->log[1], sizeof(d->log[0]) * 19);
+                d->log_lines = 19;
+            }
+            snprintf(d->log[d->log_lines++], sizeof(d->log[0]), "%s%.74s", off ? "  " : "", line + off);
+        }
+    }
+    fclose(f);
+}
+
+// The module rewrites sdmc:/config/switchrpc_status on every change and at
+// least once a minute: "<unix time>\n<state>\n<text>\n".
+static void read_status(Diag *d) {
+    d->status_fresh = false;
+    d->status_state[0] = d->status_raw[0] = '\0';
+    FILE *f = fopen(STATUS_PATH, "r");
+    if (!f) return;
+    char when[32] = "", state[16] = "", text[160] = "";
+    if (fgets(when, sizeof(when), f) && fgets(state, sizeof(state), f)) {
+        if (!fgets(text, sizeof(text), f)) text[0] = '\0';
+        char off[32] = "";
+        d->icon[0] = '\0';
+        if (fgets(d->icon, sizeof(d->icon), f))
+            d->icon[strcspn(d->icon, "\r\n")] = '\0';
+        d->have_clock = fgets(off, sizeof(off), f) != NULL;
+        d->clock_off = strtoll(off, NULL, 10);
+        state[strcspn(state, "\r\n")] = '\0';
+        text[strcspn(text, "\r\n")] = '\0';
+        snprintf(d->status_state, sizeof(d->status_state), "%s", state);
+        snprintf(d->status_raw, sizeof(d->status_raw), "%s", text);
+        u64 now = 0;
+        timeGetCurrentTime(TimeType_Default, &now);
+        u64 t = strtoull(when, NULL, 10);
+        d->status_fresh = now >= t ? now - t <= 150 : true;
+
+        d->status_color = !strcmp(state, "live") ? "\x1b[32m" : !strcmp(state, "error") ? "\x1b[31m"
+                        : !strcmp(state, "login") || !strcmp(state, "off") ? "\x1b[33m" : "";
+        if (!strcmp(state, "live"))
+            snprintf(d->status, sizeof(d->status), "Live on Discord: %s", text);
+        else
+            snprintf(d->status, sizeof(d->status), "%s", text);
+    }
+    fclose(f);
+}
+
+static void diag_refresh(Diag *d, bool have_pm) {
+    d->on_sd = file_exists(MODULE_DIR "/exefs.nsp") && access(MODULE_DIR "/flags/boot2.flag", F_OK) == 0;
+    read_log(d);
+    read_status(d);  // overrides the log-based guess when present
+    d->running = (have_pm && sysmodule_running()) || d->status_fresh;
+    d->logged_in = file_exists(TOKEN_PATH);
+    read_line_file(USER_PATH, d->user, sizeof(d->user));
+
+    NifmInternetConnectionType type;
+    u32 strength;
+    NifmInternetConnectionStatus st;
+    d->online = R_SUCCEEDED(nifmGetInternetConnectionStatus(&type, &strength, &st)) &&
+                st == NifmInternetConnectionStatus_Connected;
+}
+
+static void diag_versions(Diag *d) {
+    snprintf(d->fw, sizeof(d->fw), "?");
+    snprintf(d->ams, sizeof(d->ams), "?");
+    if (R_SUCCEEDED(setsysInitialize())) {
+        SetSysFirmwareVersion fw;
+        if (R_SUCCEEDED(setsysGetFirmwareVersion(&fw)))
+            snprintf(d->fw, sizeof(d->fw), "%s", fw.display_version);
+        setsysExit();
+    }
+    if (R_SUCCEEDED(splInitialize())) {
+        u64 v = 0;
+        if (R_SUCCEEDED(splGetConfig((SplConfigItem)65000, &v)))  // Atmosphere API version
+            snprintf(d->ams, sizeof(d->ams), "%u.%u.%u",
+                     (unsigned)((v >> 56) & 0xFF), (unsigned)((v >> 48) & 0xFF), (unsigned)((v >> 40) & 0xFF));
+        splExit();
+    }
+}
+
+static void start_module(Diag *d) {
+    if (d->running) {
+        snprintf(d->launch, sizeof(d->launch), "\x1b[32malready running, nothing to do\x1b[0m");
+        return;
+    }
+    if (R_FAILED(pmshellInitialize())) {
+        snprintf(d->launch, sizeof(d->launch), "\x1b[31mcan't talk to pm:shell\x1b[0m");
+        return;
+    }
+    NcmProgramLocation loc = { .program_id = SYSMODULE_ID, .storageID = NcmStorageId_None };
+    u64 pid = 0;
+    Result rc = pmshellLaunchProgram(0, &loc, &pid);
+    pmshellExit();
+    if (R_SUCCEEDED(rc))
+        snprintf(d->launch, sizeof(d->launch), "\x1b[32mstarted\x1b[0m");
+    else if (rc == MAKERESULT(Module_Kernel, KernelError_OutOfResource))
+        // 2001-0132: no room for another system process (usually: it's already running)
+        snprintf(d->launch, sizeof(d->launch), "\x1b[33mno free system memory (2001-0132) - reboot instead\x1b[0m");
+    else
+        snprintf(d->launch, sizeof(d->launch), "\x1b[31mAtmosphere refused, error %04u-%04u\x1b[0m",
+                 2000 + R_MODULE(rc), R_DESCRIPTION(rc));
+}
+
+static const char *mark(bool ok) { return ok ? "\x1b[32m[ OK ]\x1b[0m" : "\x1b[31m[FAIL]\x1b[0m"; }
+
+#define DIAG_LINES 26
+static char diag_buf[DIAG_LINES][160];
+
+static int diag_lines(const Diag *d, const char **out) {
+    int n = 0;
+#define L(...) do { if (n < DIAG_LINES) { snprintf(diag_buf[n], sizeof(diag_buf[0]), __VA_ARGS__); out[n] = diag_buf[n]; n++; } } while (0)
+    L("Switch Discord Activity v" SWITCHRPC_VERSION "   firmware %s   Atmosphere %s", d->fw, d->ams);
+    L("%s Module on the SD card%s", mark(d->on_sd), d->on_sd ? "" : " - copy atmosphere/ to the SD root");
+    L("%s Module running%s", mark(d->running), d->running ? "" : " - press Y to start it");
+    if (d->launch[0]) L("       Start module: %s", d->launch);
+    L("%s Logged in to Discord%s%s", d->logged_in ? mark(true) : "\x1b[33m[ -- ]\x1b[0m",
+      d->logged_in ? " as " : "", d->logged_in ? (d->user[0] ? d->user : "you") : "");
+    L("%s Internet", mark(d->online));
+    L("Now: %s%.68s\x1b[0m", d->status_color ? d->status_color : "", d->status);
+    if (d->icon[0]) L("Icon: %.70s", d->icon);
+    if (d->have_clock && (d->clock_off > 60 || d->clock_off < -60))
+        L("\x1b[33mConsole clock is %lld min %s - the module corrects for it.\x1b[0m",
+          (d->clock_off < 0 ? -d->clock_off : d->clock_off) / 60, d->clock_off < 0 ? "fast" : "slow");
+    L("\x1b[36mLog\x1b[0m (sdmc:/switchrpc_log.txt):");
+    int first = d->log_lines - (DIAG_LINES - n);
+    for (int i = first < 0 ? 0 : first; i < d->log_lines; i++)
+        L("\x1b[2m%s\x1b[0m", d->log[i]);
+#undef L
+    return n;
+}
+
+// --- settings (sdmc:/config/switchrpc.ini, read by the module) ----------------
+
+#define SETTINGS_PATH "sdmc:/config/switchrpc.ini"
+
+// language: 0 = English, 1 = Japanese, -1 = not set yet (follow the console)
+static void load_settings(bool *v, int *lang) {
+    for (int i = 0; i < Set_Count; i++) v[i] = true;
+    *lang = -1;
+    FILE *f = fopen(SETTINGS_PATH, "r");
+    if (!f) return;
+    char line[128], key[64];
+    int val;
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, " %63[a-z_] = %d", key, &val) != 2) continue;
+        if (!strcmp(key, "language")) *lang = val;
+        for (int i = 0; i < Set_Count; i++)
+            if (!strcmp(key, set_keys[i])) v[i] = val != 0;
+    }
+    fclose(f);
+}
+
+static void save_settings(const bool *v, Lang lang) {
+    mkdir("sdmc:/config", 0777);
+    FILE *f = fopen(SETTINGS_PATH, "w");
+    if (!f) return;
+    fprintf(f, "# Switch Discord Activity settings - change them in the Switch Discord Activity app\n");
+    for (int i = 0; i < Set_Count; i++)
+        fprintf(f, "%s=%d\n", set_keys[i], v[i] ? 1 : 0);
+    fprintf(f, "language=%d\n", lang == Lang_Ja ? 1 : 0);
+    fclose(f);
+}
+
+static Lang console_lang(void) {
+    u64 code = 0;
+    SetLanguage l;
+    if (R_SUCCEEDED(setInitialize())) {
+        bool ja = R_SUCCEEDED(setGetSystemLanguage(&code)) && R_SUCCEEDED(setMakeLanguage(code, &l)) && l == SetLanguage_JA;
+        setExit();
+        return ja ? Lang_Ja : Lang_En;
+    }
+    return Lang_En;
+}
+
+
+// --- "Test" button: the module's Discord requests, step by step, on screen ----
+
+#define SUPER_PROPS "X-Super-Properties: eyJicm93c2VyIjoiRGlzY29yZCBFbWJlZGRlZCIsImJyb3dzZXJfdXNlcl9hZ2VudCI6IkRpc2NvcmQgRW1iZWRkZWQvMC4wLjgiLCJicm93c2VyX3ZlcnNpb24iOiIwLjAuOCIsImNsaWVudF9idWlsZF9udW1iZXIiOjMwNDY4MywiZGVzaWduX2lkIjowLCJvcyI6IlVua25vd24iLCJyZWxlYXNlX2NoYW5uZWwiOiJ1bmtub3duIn0K"
+
+typedef struct {
+    char lines[24][96];
+    int n;
+    char session[512];   // test session token, deleted when leaving the screen
+    char access[512];
+} Test;
+
+static void test_line(Test *t, const char *color, const char *fmt, ...) {
+    char buf[600];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    // wrap at 74 columns
+    for (size_t off = 0, len = strlen(buf); off < len || off == 0; off += 74) {
+        if (t->n == 24) return;
+        snprintf(t->lines[t->n++], sizeof(t->lines[0]), "%s%.74s\x1b[0m", color, buf + off);
+        if (len == 0) break;
+    }
+}
+
+static void draw_test(const Test *t, bool done) {
+    const char *lines[24];
+    for (int i = 0; i < t->n; i++) lines[i] = t->lines[i];
+    ui_frame_begin();
+    ui_lines(tr(T_TestTitle), lines, t->n, done ? tr(T_FooterBack) : tr(T_FooterWorking));
+    ui_frame_end();
+}
+
+// Like the module's sendRequest: same headers, any status code comes back.
+static char *discord_req(const char *url, const char *method, const char *ctype, const char *body,
+                         const char *bearer, long *code, char *err, size_t err_size) {
+    CURL *curl = curl_easy_init();
+    char *resp = NULL;
+    *code = 0;
+    err[0] = '\0';
+    if (!curl) { snprintf(err, err_size, "curl init failed"); return NULL; }
+    struct curl_slist *h = NULL;
+    h = curl_slist_append(h, "Accept: application/json");
+    h = curl_slist_append(h, "User-Agent: Discord Embedded/0.0.8");
+    h = curl_slist_append(h, SUPER_PROPS);
+    char tmp[700];
+    if (ctype) { snprintf(tmp, sizeof(tmp), "Content-Type: %s", ctype); h = curl_slist_append(h, tmp); }
+    if (bearer) { snprintf(tmp, sizeof(tmp), "Authorization: Bearer %s", bearer); h = curl_slist_append(h, tmp); }
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, h);
+    if (body) curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 20L);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, collect);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
+    CURLcode rc = curl_easy_perform(curl);
+    if (rc != CURLE_OK)
+        snprintf(err, err_size, "%s", curl_easy_strerror(rc));
+    else
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, code);
+    curl_slist_free_all(h);
+    curl_easy_cleanup(curl);
+    return resp;
+}
+
+static void run_test(Test *t) {
+    memset(t, 0, sizeof(*t));
+    long code;
+    char err[160];
+
+    // 1. refresh token -> access token (exactly what the module does first)
+    char refresh[1024] = "";
+    read_line_file(TOKEN_PATH, refresh, sizeof(refresh));
+    if (!refresh[0]) {
+        test_line(t, "\x1b[31m", "1. Login: no token on the SD card - press B, then A to log in.");
+        return;
+    }
+    test_line(t, "", "1. Refreshing the Discord login...");
+    draw_test(t, false);
+    char body[1400];
+    snprintf(body, sizeof(body), "grant_type=refresh_token&refresh_token=%s&client_id=" CLIENT_ID, refresh);
+    char *resp = discord_req("https://gaming-sdk.com/api/v9/oauth2/token", "POST",
+                             "application/x-www-form-urlencoded; charset=utf-8", body, NULL, &code, err, sizeof(err));
+    json_object *tok = resp ? json_tokener_parse(resp) : NULL;
+    const char *new_refresh = jstr(tok, "refresh_token"), *access = jstr(tok, "access_token");
+    if (!access) {
+        if (err[0]) test_line(t, "\x1b[31m", "   FAILED: no connection (%s)", err);
+        else test_line(t, "\x1b[31m", "   FAILED: HTTP %ld %s", code, resp ? resp : "");
+        if (code == 400 || code == 401)
+            test_line(t, "\x1b[33m", "   -> the login is no longer valid: press B, X, then A to log in again.");
+        json_object_put(tok);
+        free(resp);
+        return;
+    }
+    snprintf(t->access, sizeof(t->access), "%s", access);
+    if (new_refresh) {
+        // refresh tokens rotate: keep the new one for the module
+        FILE *f = fopen(TOKEN_PATH, "w");
+        if (f) { fputs(new_refresh, f); fclose(f); }
+    }
+    test_line(t, "\x1b[32m", "   OK (HTTP %ld), scopes: %s", code, jstr(tok, "scope") ? jstr(tok, "scope") : "?");
+    json_object_put(tok);
+    free(resp);
+
+    // 2. who am I
+    test_line(t, "", "2. Checking the account...");
+    draw_test(t, false);
+    resp = discord_req("https://gaming-sdk.com/api/v9/oauth2/@me", "GET", NULL, NULL, t->access, &code, err, sizeof(err));
+    json_object *me = resp ? json_tokener_parse(resp) : NULL, *u;
+    if (me && json_object_object_get_ex(me, "user", &u))
+        test_line(t, "\x1b[32m", "   OK, logged in as %s", jstr(u, "username") ? jstr(u, "username") : "?");
+    else
+        test_line(t, "\x1b[31m", "   FAILED: HTTP %ld %s%s", code, err, resp ? resp : "");
+    json_object_put(me);
+    free(resp);
+
+    // 3. the headless session itself, same JSON shape as the module
+    test_line(t, "", "3. Creating a test status \"Switch Discord Activity test\"...");
+    draw_test(t, false);
+    snprintf(body, sizeof(body),
+             "{\"activities\":[{\"type\":\"0\",\"flags\":\"0\",\"application_id\":\"" CLIENT_ID "\","
+             "\"platform\":\"desktop\",\"name\":\"Switch Discord Activity test\",\"state\":\"on Nintendo Switch\","
+             "\"assets\":{\"large_image\":\"https://raw.githubusercontent.com/switchbrew/nx-hbmenu/master/icon.jpg\"}}]}");
+    resp = discord_req("https://gaming-sdk.com/api/v9/users/@me/headless-sessions", "POST",
+                       "application/json; charset=utf-8", body, t->access, &code, err, sizeof(err));
+    json_object *sess = resp ? json_tokener_parse(resp) : NULL;
+    if (code >= 200 && code < 300 && jstr(sess, "token")) {
+        snprintf(t->session, sizeof(t->session), "%s", jstr(sess, "token"));
+        test_line(t, "\x1b[32m", "   OK (HTTP %ld) - look at Discord now: \"Switch Discord Activity test\".", code);
+        test_line(t, "", "   If it's there, Discord works and the problem is in the module.");
+        test_line(t, "", "   If it's NOT there although this says OK: Discord -> Settings ->");
+        test_line(t, "", "   Activity Privacy -> share your activity.");
+    } else if (err[0]) {
+        test_line(t, "\x1b[31m", "   FAILED: no connection (%s)", err);
+    } else {
+        test_line(t, "\x1b[31m", "   FAILED: HTTP %ld %s", code, resp ? resp : "");
+    }
+    json_object_put(sess);
+    free(resp);
+}
+
+static void end_test(Test *t) {
+    if (!t->session[0]) return;
+    char body[700], err[160];
+    long code;
+    snprintf(body, sizeof(body), "{\"token\":\"%s\"}", t->session);
+    free(discord_req("https://gaming-sdk.com/api/v9/users/@me/headless-sessions/delete", "POST",
+                     "application/json; charset=utf-8", body, t->access, &code, err, sizeof(err)));
+    t->session[0] = '\0';
+}
+
+
+// --- "Prepare icons" (L): icons for forwarders & co, uploaded once ------------
+//
+// Discord only shows images by URL. For every installed title no icon
+// database knows, the app uploads the title's own icon (freeimage.host,
+// catbox.moe as a fallback) and writes the link to the cache the module
+// reads - so the module never has to upload anything itself.
+
+#define ESHOP_CACHE  "sdmc:/config/switchrpc-eshop-iconcache.json"
+#define UPLOAD_CACHE "sdmc:/config/switchrpc-uploaded-icons.json"
+
+typedef struct {
+    char lines[24][96];
+    int n;
+    int done, total, uploaded, failed;
+} IconJob;
+
+static void job_line(IconJob *j, const char *color, const char *fmt, ...) {
+    char buf[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (j->n == 24) { memmove(j->lines[0], j->lines[1], sizeof(j->lines[0]) * 23); j->n = 23; }
+    snprintf(j->lines[j->n++], sizeof(j->lines[0]), "%s%.74s\x1b[0m", color, buf);
+}
+
+static void draw_icons(const IconJob *j, bool finished) {
+    const char *lines[24];
+    for (int i = 0; i < j->n; i++) lines[i] = j->lines[i];
+    char title[128];
+    snprintf(title, sizeof(title), "%s  %d/%d", tr(T_IconsTitle), j->done, j->total);
+    ui_frame_begin();
+    ui_lines(title, lines, j->n, finished ? tr(T_FooterBack) : tr(T_FooterWorking));
+    ui_frame_end();
+}
+
+static json_object *cache_load(const char *path) {
+    json_object *o = json_object_from_file(path);
+    if (!o || !json_object_is_type(o, json_type_object)) {
+        json_object_put(o);
+        o = json_object_new_object();
+    }
+    return o;
+}
+
+static size_t sink(char *p, size_t s, size_t n, void *u) { (void)p; (void)u; return s * n; }
+
+static bool url_is_image(const char *url) {
+    CURL *c = curl_easy_init();
+    if (!c) return false;
+    curl_easy_setopt(c, CURLOPT_URL, url);
+    curl_easy_setopt(c, CURLOPT_NOBODY, 1L);
+    curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, 0L);
+    curl_easy_setopt(c, CURLOPT_SSL_VERIFYHOST, 0L);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, 10L);
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, sink);
+    bool ok = false;
+    if (curl_easy_perform(c) == CURLE_OK) {
+        long code = 0; char *type = NULL;
+        curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
+        curl_easy_getinfo(c, CURLINFO_CONTENT_TYPE, &type);
+        ok = code == 200 && type && !strncmp(type, "image/", 6);
+    }
+    curl_easy_cleanup(c);
+    return ok;
+}
+
+// Nintendo's EU eShop search, same query as the module
+static bool eshop_icon(const char *tid, char *out, size_t size) {
+    char url[512];
+    snprintf(url, sizeof(url),
+             "https://searching.nintendo-europe.com/en/select?q=application_id_s%%3A%s&wt=json&fq=type%%3AGAME"
+             "&fl=application_id_s%%2Cimage_url_sq_s&rows=5", tid);
+    char err[128]; long code;
+    char *resp = discord_req(url, "GET", NULL, NULL, NULL, &code, err, sizeof(err));
+    bool found = false;
+    json_object *root = resp ? json_tokener_parse(resp) : NULL, *r, *docs;
+    if (root && json_object_object_get_ex(root, "response", &r) && json_object_object_get_ex(r, "docs", &docs)) {
+        for (size_t i = 0; i < json_object_array_length(docs) && !found; i++) {
+            json_object *doc = json_object_array_get_idx(docs, i);
+            const char *id = jstr(doc, "application_id_s"), *img = jstr(doc, "image_url_sq_s");
+            if (id && img && !strcasecmp(id, tid)) {
+                snprintf(out, size, "%s", img);
+                found = true;
+            }
+        }
+    }
+    json_object_put(root);
+    free(resp);
+    return found;
+}
+
+static bool upload_icon(const u8 *data, size_t len, bool catbox, char *out, size_t size, char *err, size_t err_size) {
+    CURL *c = curl_easy_init();
+    if (!c) { snprintf(err, err_size, "curl init"); return false; }
+    curl_mime *mime = curl_mime_init(c);
+    curl_mimepart *part;
+    if (catbox) {
+        part = curl_mime_addpart(mime); curl_mime_name(part, "reqtype"); curl_mime_data(part, "fileupload", CURL_ZERO_TERMINATED);
+        part = curl_mime_addpart(mime); curl_mime_name(part, "fileToUpload");
+    } else {
+        part = curl_mime_addpart(mime); curl_mime_name(part, "key");    curl_mime_data(part, "6d207e02198a847aa98d0a2a901485a5", CURL_ZERO_TERMINATED);
+        part = curl_mime_addpart(mime); curl_mime_name(part, "action"); curl_mime_data(part, "upload", CURL_ZERO_TERMINATED);
+        part = curl_mime_addpart(mime); curl_mime_name(part, "format"); curl_mime_data(part, "json", CURL_ZERO_TERMINATED);
+        part = curl_mime_addpart(mime); curl_mime_name(part, "source");
+    }
+    curl_mime_filename(part, "icon.jpg");
+    curl_mime_type(part, "image/jpeg");
+    curl_mime_data(part, (const char *)data, len);
+
+    char *resp = NULL;
+    curl_easy_setopt(c, CURLOPT_URL, catbox ? "https://catbox.moe/user/api.php" : "https://freeimage.host/api/1/upload");
+    curl_easy_setopt(c, CURLOPT_MIMEPOST, mime);
+    curl_easy_setopt(c, CURLOPT_USERAGENT, "SwitchRPC/1.0");
+    curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, 0L);
+    curl_easy_setopt(c, CURLOPT_SSL_VERIFYHOST, 0L);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, 40L);
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, collect);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, &resp);
+    CURLcode rc = curl_easy_perform(c);
+    long code = 0;
+    curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
+    curl_mime_free(mime);
+    curl_easy_cleanup(c);
+
+    bool ok = false;
+    if (rc != CURLE_OK) {
+        snprintf(err, err_size, "%s", curl_easy_strerror(rc));
+    } else if (code != 200 || !resp) {
+        snprintf(err, err_size, "HTTP %ld %.60s", code, resp ? resp : "");
+    } else if (catbox) {
+        // plain text answer: the file URL
+        resp[strcspn(resp, "\r\n")] = '\0';
+        ok = !strncmp(resp, "https://", 8);
+        if (ok) snprintf(out, size, "%s", resp); else snprintf(err, err_size, "%.60s", resp);
+    } else {
+        json_object *root = json_tokener_parse(resp), *img, *u;
+        if (root && json_object_object_get_ex(root, "image", &img) && json_object_object_get_ex(img, "url", &u)) {
+            snprintf(out, size, "%s", json_object_get_string(u));
+            ok = !strncmp(out, "https://", 8);
+        }
+        if (!ok) snprintf(err, err_size, "unexpected answer %.50s", resp);
+        json_object_put(root);
+    }
+    free(resp);
+    return ok;
+}
+
+static void prepare_icons(IconJob *j, PadState *pad) {
+    memset(j, 0, sizeof(*j));
+    if (R_FAILED(nsInitialize())) {
+        job_line(j, "\x1b[31m", "Can't open the title list (ns).");
+        return;
+    }
+    static NsApplicationRecord recs[512];
+    s32 count = 0;
+    nsListApplicationRecord(recs, 512, 0, &count);
+    j->total = count;
+
+    json_object *eshop = cache_load(ESHOP_CACHE), *uploads = cache_load(UPLOAD_CACHE);
+    NsApplicationControlData *ctrl = malloc(sizeof(*ctrl));
+
+    for (s32 i = 0; i < count && ctrl; i++) {
+        padUpdate(pad);
+        if (padGetButtonsDown(pad) & HidNpadButton_B) { job_line(j, "\x1b[33m", "Stopped."); break; }
+
+        char tid[17];
+        snprintf(tid, sizeof(tid), "%016llx", (unsigned long long)recs[i].application_id);
+        u64 actual = 0;
+        char name[64] = "?";
+        bool have_ctrl = R_SUCCEEDED(nsGetApplicationControlData(NsApplicationControlSource_Storage,
+                                     recs[i].application_id, ctrl, sizeof(*ctrl), &actual));
+        if (have_ctrl) {
+            NacpLanguageEntry *le = NULL;
+            if (R_SUCCEEDED(nacpGetLanguageEntry(&ctrl->nacp, &le)) && le && le->name[0])
+                snprintf(name, sizeof(name), "%.40s", le->name);
+        }
+        j->done = i + 1;
+
+        json_object *tmp;
+        if (json_object_object_get_ex(eshop, tid, &tmp) || json_object_object_get_ex(uploads, tid, &tmp)) {
+            job_line(j, "", "%s: cached", name);
+        } else {
+            char url[300], err[128] = "";
+            draw_icons(j, false);
+            if (eshop_icon(tid, url, sizeof(url))) {
+                json_object_object_add(eshop, tid, json_object_new_string(url));
+                job_line(j, "\x1b[32m", "%s: eShop icon", name);
+            } else {
+                char tf[80];
+                snprintf(tf, sizeof(tf), "https://tinfoil.media/ti/%016llX/512/512/", (unsigned long long)recs[i].application_id);
+                if (url_is_image(tf)) {
+                    json_object_object_add(eshop, tid, json_object_new_string(tf));
+                    job_line(j, "\x1b[32m", "%s: tinfoil icon", name);
+                } else if (!have_ctrl || actual <= sizeof(ctrl->nacp)) {
+                    j->failed++;
+                    job_line(j, "\x1b[31m", "%s: has no icon of its own", name);
+                } else {
+                    size_t len = actual - sizeof(ctrl->nacp);
+                    bool ok = upload_icon(ctrl->icon, len, false, url, sizeof(url), err, sizeof(err));
+                    const char *host = "freeimage";
+                    if (!ok) {
+                        char err2[128];
+                        ok = upload_icon(ctrl->icon, len, true, url, sizeof(url), err2, sizeof(err2));
+                        host = "catbox";
+                        if (!ok) { strncat(err, " / catbox: ", sizeof(err) - strlen(err) - 1);
+                                   strncat(err, err2, sizeof(err) - strlen(err) - 1); }
+                    }
+                    if (ok) {
+                        json_object_object_add(uploads, tid, json_object_new_string(url));
+                        j->uploaded++;
+                        job_line(j, "\x1b[32m", "%s: uploaded (%s) %s", name, host, url);
+                    } else {
+                        j->failed++;
+                        job_line(j, "\x1b[31m", "%s: upload failed: %s", name, err);
+                    }
+                }
+            }
+            // save as we go, so stopping halfway keeps what's done
+            json_object_to_file_ext(ESHOP_CACHE, eshop, JSON_C_TO_STRING_PLAIN);
+            json_object_to_file_ext(UPLOAD_CACHE, uploads, JSON_C_TO_STRING_PLAIN);
+        }
+        draw_icons(j, false);
+    }
+    free(ctrl);
+    json_object_put(eshop);
+    json_object_put(uploads);
+    nsExit();
+    job_line(j, "\x1b[1m", "Done. The module uses these right away (no reboot needed).");
+}
+
+static void draw_login(const Login *lg, const char *note) {
+    char url[48];
+    snprintf(url, sizeof(url), "http://%s:%d", lg->ip, LOGIN_PORT);
+    static uint8_t grid[64 * 64];
+    int size = make_qr(url, grid, 64);
+    ui_frame_begin();
+    ui_login(url, grid, size, note);
+    ui_frame_end();
+}
+
+// up/down walk the list; left/right jump between the two columns
+static int move_sel(int sel, u64 down) {
+    if (down & HidNpadButton_AnyDown) return (sel + 1) % Item_Count;
+    if (down & HidNpadButton_AnyUp)   return (sel + Item_Count - 1) % Item_Count;
+    bool l = down & HidNpadButton_AnyLeft, r = down & HidNpadButton_AnyRight;
+    if (!l && !r) return sel;
+    if (sel >= Item_FirstToggle && sel <= Item_LastToggle) {
+        int k = sel - Item_FirstToggle, n = Item_LastToggle - Item_FirstToggle + 1;
+        k = r ? k + TOGGLE_ROWS : k - TOGGLE_ROWS;
+        if (k >= 0 && k < n) return Item_FirstToggle + k;
+    } else if (sel >= Item_Login) {
+        int k = sel - Item_Login;
+        k = r ? k + 1 : k - 1;
+        if (k >= 0 && Item_Login + k < Item_Count) return Item_Login + k;
+    }
+    return sel;
+}
+
+int main(int argc, char **argv) {
+    padConfigureInput(1, HidNpadStyleSet_NpadStandard);
+    PadState pad;
+    padInitializeDefault(&pad);
+
+    socketInitializeDefault();
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+    bool have_nifm = R_SUCCEEDED(nifmInitialize(NifmServiceType_User));
+    bool have_pm   = R_SUCCEEDED(pmdmntInitialize());
+    timeInitialize();
+
+    bool set[Set_Count];
+    int lang_setting;
+    load_settings(set, &lang_setting);
+    Lang lang = lang_setting < 0 ? console_lang() : lang_setting == 1 ? Lang_Ja : Lang_En;
+    if (!ui_init(lang)) {
+        // no graphics (shouldn't happen): leave quietly instead of crashing
+        curl_global_cleanup();
+        socketExit();
+        return 0;
+    }
+
+    char msg[200] = "";
+    Tone msg_tone = Tone_Normal;
+    u64 msg_frame = 0;
+    // the previous (PC-based) version of this project used another module id;
+    // remove it completely so it neither boots nor shows up in ovl-sysmodules
+    if (access(OLD_MODULE, F_OK) == 0) {
+        remove_tree(OLD_MODULE);
+        snprintf(msg, sizeof(msg), access(OLD_MODULE, F_OK) != 0
+                 ? "Removed the old \"Switch Discord RPC\" module (gone after a reboot)."
+                 : "Couldn't remove " OLD_MODULE " - delete it by hand.");
+        msg_tone = Tone_Warn;
+    }
+
+    // this app used to be switch-rpc.nro: drop the old copy so the Homebrew
+    // Menu doesn't list it twice
+    if (!(argc > 0 && argv[0] && strstr(argv[0], "switch-rpc.nro")) && access(OLD_NRO, F_OK) == 0)
+        remove(OLD_NRO);
+
+    Diag d = {0};
+    diag_versions(&d);
+    diag_refresh(&d, have_pm);
+    Screen screen = Screen_Main;
+    Login lg = { .fd = -1 };
+    static Test test;
+    static IconJob icon_job;
+    int sel = Item_Master;
+    u64 frame = 0;
+
+    // every frame: input, then draw the current screen (the scene is animated)
+    while (appletMainLoop()) {
+        padUpdate(&pad);
+        u64 down = padGetButtonsDown(&pad);
+
+        if (screen == Screen_Main) {
+            if (down & HidNpadButton_Plus)
+                break;
+            sel = move_sel(sel, down);
+
+            bool toggle_master = (down & HidNpadButton_Minus) || (sel == Item_Master && (down & HidNpadButton_A));
+            if (toggle_master) {
+                set[Set_Enabled] = !set[Set_Enabled];
+                save_settings(set, ui_lang());
+                snprintf(msg, sizeof(msg), "%s", tr(set[Set_Enabled] ? T_MsgOn : T_MsgOff));
+                msg_tone = set[Set_Enabled] ? Tone_Good : Tone_Warn;
+            } else if (down & HidNpadButton_A) {
+                if (sel >= Item_FirstToggle && sel <= Item_LastToggle) {
+                    set[sel] = !set[sel];
+                    save_settings(set, ui_lang());
+                    snprintf(msg, sizeof(msg), "%s", tr(T_MsgSaved));
+                    msg_tone = Tone_Normal;
+                } else if (sel == Item_Lang) {
+                    ui_set_lang(ui_lang() == Lang_En ? Lang_Ja : Lang_En);
+                    save_settings(set, ui_lang());
+                    msg[0] = '\0';
+                } else if (sel == Item_Login) {
+                    if (d.logged_in) {
+                        // the module notices the missing file and clears your status
+                        remove(TOKEN_PATH);
+                        remove(USER_PATH);
+                        snprintf(msg, sizeof(msg), "%s", tr(T_MsgLoggedOut));
+                        msg_tone = Tone_Normal;
+                    } else if (!have_nifm || !login_start(&lg)) {
+                        snprintf(msg, sizeof(msg), "%s", tr(T_MsgNoWifi));
+                        msg_tone = Tone_Bad;
+                    } else {
+                        screen = Screen_Login;
+                        msg[0] = '\0';
+                    }
+                } else if (sel == Item_Test) {
+                    screen = Screen_Test;
+                    run_test(&test);
+                } else if (sel == Item_Icons) {
+                    screen = Screen_Icons;
+                    prepare_icons(&icon_job, &pad);
+                } else if (sel == Item_Diag) {
+                    screen = Screen_Diag;
+                }
+                frame = 0;  // refresh the state right away
+            }
+        } else if (screen == Screen_Diag) {
+            if (down & (HidNpadButton_B | HidNpadButton_Plus)) { screen = Screen_Main; frame = 0; }
+            if (down & HidNpadButton_Y) { start_module(&d); frame = 0; }
+        } else if (screen == Screen_Icons) {
+            if (down & (HidNpadButton_B | HidNpadButton_Plus)) { screen = Screen_Main; frame = 0; }
+        } else if (screen == Screen_Test) {
+            if (down & (HidNpadButton_B | HidNpadButton_Plus)) { end_test(&test); screen = Screen_Main; frame = 0; }
+        } else {  // login
+            if (down & (HidNpadButton_B | HidNpadButton_Plus)) {
+                login_stop(&lg);
+                screen = Screen_Main;
+                frame = 0;
+            } else {
+                login_poll(&lg);
+                if (lg.got_code) {
+                    login_stop(&lg);
+                    draw_login(&lg, tr(T_MsgFinishing));
+                    char user[64];
+                    if (login_finish(&lg, user, sizeof(user))) {
+                        snprintf(msg, sizeof(msg), tr(T_MsgLoginOk), user);
+                        msg_tone = Tone_Good;
+                    } else {
+                        snprintf(msg, sizeof(msg), "%s", tr(T_MsgLoginFail));
+                        msg_tone = Tone_Bad;
+                    }
+                    screen = Screen_Main;
+                    frame = 0;
+                }
+            }
+        }
+
+        // a message stays ~3 seconds, then the help line comes back
+        // (`frame` gets reset to force a refresh, so count separately)
+        static u64 tick;
+        static char last_msg[200];
+        tick++;
+        if (strcmp(last_msg, msg)) { snprintf(last_msg, sizeof(last_msg), "%s", msg); msg_frame = tick; }
+        bool show_msg = msg[0] && tick - msg_frame < 180;
+
+        // re-check the module / login state every 2 seconds
+        if (frame % 120 == 0)
+            diag_refresh(&d, have_pm);
+
+        switch (screen) {
+        case Screen_Main: {
+            MenuModel m = {0};
+            m.logged_in = d.logged_in;
+            m.user = d.user;
+            m.running = d.running;
+            m.status_state = d.status_state;
+            m.status_text = d.status_state[0] ? d.status_raw : d.status;  // no status file yet: log guess
+            memcpy(m.set, set, sizeof(set));
+            m.sel = sel;
+            m.msg = show_msg ? msg : NULL;
+            m.msg_tone = msg_tone;
+            if (!ui_frame_begin()) goto done;
+            ui_menu(&m);
+            ui_frame_end();
+            break;
+        }
+        case Screen_Diag: {
+            const char *lines[DIAG_LINES];
+            int n = diag_lines(&d, lines);
+            if (!ui_frame_begin()) goto done;
+            ui_lines(tr(T_DiagTitle), lines, n, tr(T_FooterDiag));
+            ui_frame_end();
+            break;
+        }
+        case Screen_Test:  draw_test(&test, true); break;
+        case Screen_Icons: draw_icons(&icon_job, true); break;
+        case Screen_Login: draw_login(&lg, NULL); break;
+        }
+        frame++;  // vsync paces the loop at 60 fps
+    }
+
+done:
+    login_stop(&lg);
+    end_test(&test);
+    ui_exit();
+    if (have_pm)   pmdmntExit();
+    if (have_nifm) nifmExit();
+    curl_global_cleanup();
+    socketExit();
+    return 0;
+}
