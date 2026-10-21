@@ -2,11 +2,7 @@
 
 Discord Rich Presence for a modded Nintendo Switch, **with no PC**. The console sets your Discord status by itself: log in once with your phone, and from then on Discord shows what you play.
 
-> **Playing Mario Kart 8 Deluxe**
-> on Nintendo Switch · Docked · 152 h total
-> 01:23:45 elapsed
-
-![Menu](docs/menu-en.png)
+![Discord status from a Switch](docs/discord-status.png)
 
 Based on [llsc12/SwitchRPC](https://github.com/llsc12/SwitchRPC). See [what's different](#differences-from-llsc12switchrpc).
 
@@ -41,6 +37,8 @@ That's it. Start a game, and it shows up on Discord within a few seconds. You do
 **Not showing up?** In Discord, open *Settings → Activity Privacy* and turn on sharing your activity.
 
 ## The menu
+
+![Menu](docs/menu-en.png)
 
 | | |
 |---|---|
