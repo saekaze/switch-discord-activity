@@ -10,8 +10,6 @@ Discord Rich Presence for a modded Nintendo Switch, **with no PC**. The console 
 
 Based on [llsc12/SwitchRPC](https://github.com/llsc12/SwitchRPC). See [what's different](#differences-from-llsc12switchrpc).
 
-[Русский](README.ru.md)
-
 ## Features
 
 - **Name** read from the game itself, in the console's language.
@@ -73,7 +71,7 @@ This project started from [llsc12/SwitchRPC](https://github.com/llsc12/SwitchRPC
 
 | | llsc12/SwitchRPC | Switch Discord Activity |
 |---|---|---|
-| **Where requests go** | `discord.com` (times out where it's blocked, e.g. Russia) | everything through `gaming-sdk.com`, Discord's Social SDK API host |
+| **Where requests go** | `discord.com` (times out on networks that block it) | everything through `gaming-sdk.com`, Discord's Social SDK API host |
 | **Second line** | `Nintendo Switch` | `on Nintendo Switch`, optionally `· Docked`, `· 152 h total` |
 | **Unknown titles / forwarders** | a tinfoil link, broken if tinfoil has no icon | tinfoil is checked first; otherwise the title's own icon is uploaded once and cached |
 | **`.nro` from the Homebrew Menu** | not shown | `Homebrew` |

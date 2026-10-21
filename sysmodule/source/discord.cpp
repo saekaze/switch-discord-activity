@@ -22,7 +22,7 @@ const char* clientId = DISCORD_CLIENT_ID;
 
 // Every request goes to gaming-sdk.com (the Discord Social SDK API host).
 // It serves the same /api/v9 routes as discord.com, and stays reachable
-// where discord.com itself is blocked (e.g. Russia) - with discord.com the
+// on networks that block discord.com itself - with discord.com the
 // session request just timed out there.
 
 // discord authentication tokens
