@@ -1,7 +1,9 @@
 #---------------------------------------------------------------------------------
-# Switch Discord Activity - builds the background module and the app, packs the SD card zip.
-#   make          build both
-#   make dist     out/switch-discord-activity-<version>.zip  (copy its contents to the SD root)
+# Switch Discord Activity - builds the background module, the app and the Tesla
+# overlay, packs the SD card zip.
+#   make          build all three
+#   make dist     out/switch-discord-activity-<version>.zip  (copy its contents to the SD root),
+#                 plus the loose files and SHA256SUMS the in-app updater downloads
 #   make clean
 # Needs devkitPro with switch-dev, switch-curl, switch-libjson-c, switch-sdl2,
 # switch-sdl2_ttf, switch-sdl2_image.
@@ -11,9 +13,9 @@ TID       := $(shell sed -n 's/.*SYSMODULE_TID 0x\([0-9A-Fa-f]*\)ULL/\1/p' inclu
 STAGE     := out/sd
 ZIP       := out/switch-discord-activity-$(VERSION).zip
 
-.PHONY: all sysmodule app dist clean
+.PHONY: all sysmodule app overlay dist clean
 
-all: sysmodule app
+all: sysmodule app overlay
 
 sysmodule:
 	@$(MAKE) --no-print-directory -C sysmodule
@@ -21,17 +23,25 @@ sysmodule:
 app:
 	@$(MAKE) --no-print-directory -C app
 
+overlay:
+	@$(MAKE) --no-print-directory -C overlay
+
 dist: all
-	@rm -rf $(STAGE) $(ZIP)
-	@mkdir -p $(STAGE)/atmosphere/contents/$(TID)/flags $(STAGE)/switch
+	@rm -rf out
+	@mkdir -p $(STAGE)/atmosphere/contents/$(TID)/flags $(STAGE)/switch/.overlays
 	@cp sysmodule/SwitchRPC.nsp $(STAGE)/atmosphere/contents/$(TID)/exefs.nsp
 	@cp sysmodule/toolbox.json $(STAGE)/atmosphere/contents/$(TID)/toolbox.json
 	@touch $(STAGE)/atmosphere/contents/$(TID)/flags/boot2.flag
 	@cp app/switch-discord-activity.nro $(STAGE)/switch/switch-discord-activity.nro
+	@cp overlay/switch-discord-activity.ovl $(STAGE)/switch/.overlays/switch-discord-activity.ovl
 	@cd $(STAGE) && zip -qr ../$(notdir $(ZIP)) atmosphere switch
+	@cp sysmodule/SwitchRPC.nsp out/exefs.nsp
+	@cp app/switch-discord-activity.nro overlay/switch-discord-activity.ovl out/
+	@cd out && sha256sum exefs.nsp switch-discord-activity.nro switch-discord-activity.ovl $(notdir $(ZIP)) > SHA256SUMS
 	@echo "built $(ZIP)"
 
 clean:
 	@$(MAKE) --no-print-directory -C sysmodule clean
 	@$(MAKE) --no-print-directory -C app clean
+	@$(MAKE) --no-print-directory -C overlay clean
 	@rm -rf out

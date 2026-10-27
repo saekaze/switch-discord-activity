@@ -17,6 +17,10 @@ The release binaries contain or link these components. Their licenses apply to t
 | [libjpeg-turbo](https://libjpeg-turbo.org) | app | IJG / BSD-3-Clause |
 | [libwebp](https://chromium.googlesource.com/webm/libwebp) | app | BSD-3-Clause |
 | [bzip2](https://sourceware.org/bzip2/) | app | bzip2 (BSD-style) |
+| [libtesla](https://github.com/WerWolv/libtesla) (`overlay/libs/libtesla/`) | overlay | GPL-2.0-or-later |
+| [stb_truetype](https://github.com/nothings/stb) (shipped with libtesla) | overlay | Public domain / MIT |
+
+**The overlay (`switch-discord-activity.ovl`) is built with libtesla, so the overlay binary is distributed under the GNU GPL v2 or later** (see `overlay/libs/libtesla/LICENSE`). Its complete source is in `overlay/`. The project's own code, including `overlay/source/`, stays under the MIT license; the sysmodule and the app don't contain any GPL code.
 
 Portions of this software are copyright © The FreeType Project (www.freetype.org). All rights reserved.
 

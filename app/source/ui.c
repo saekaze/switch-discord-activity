@@ -27,10 +27,6 @@
 #define SCREEN_W 1280
 #define SCREEN_H 720
 
-const char *const set_keys[Set_Count] = {
-    "enabled", "paused", "system_screens", "show_timer", "show_icon", "show_game_name",
-    "dock_mode", "total_playtime", "paused_time", "eshop_button", "homebrew_tag",
-};
 
 // --- strings -------------------------------------------------------------------
 
@@ -61,6 +57,10 @@ static const char *const strings[T_Count][2] = {
     [T_Icons]        = { "Prepare icons", "アイコンを準備" },
     [T_Diag]         = { "Diagnostics & log", "診断とログ" },
     [T_Lang]         = { "Language: English", "言語: 日本語" },
+    [T_Update]       = { "Check for updates", "アップデートを確認" },
+    [T_UpdateTo]     = { "Update to %s", "%s にアップデート" },
+    [T_UpdateTitle]  = { "Update", "アップデート" },
+    [T_UpdateAvail]  = { "update %s available", "アップデート %s があります" },
     [T_FooterMenu]   = { "[↑↓] select   [A] toggle / open   [-] status on/off   [+] exit",
                          "[↑↓] 選択   [A] 切替 / 開く   [-] ステータス オン/オフ   [+] 終了" },
     [T_FooterBack]   = { "[B] back", "[B] 戻る" },
@@ -90,19 +90,6 @@ static const char *const strings[T_Count][2] = {
     [T_MsgFinishing] = { "Got it, finishing login...", "ログインを完了しています…" },
 };
 
-static const char *const setting_labels[Set_Count][2] = {
-    [Set_Enabled]    = { "Discord status", "Discordステータス" },
-    [Set_Paused]     = { "Paused in background", "一時停止を表示" },
-    [Set_Screens]    = { "HOME / eShop / Album", "HOMEやeショップ" },
-    [Set_Timer]      = { "Elapsed time", "経過時間" },
-    [Set_Icon]       = { "Game icon", "ゲームアイコン" },
-    [Set_GameName]   = { "Game name", "ゲーム名" },
-    [Set_Dock]       = { "Docked / Handheld", "TV / 携帯モード" },
-    [Set_Playtime]   = { "Total playtime", "総プレイ時間" },
-    [Set_PausedTime] = { "Time while paused", "一時停止中の時間" },
-    [Set_Button]     = { "eShop button", "eショップボタン" },
-    [Set_HbTag]      = { "\"(homebrew)\" tag", "「(homebrew)」表記" },
-};
 
 static const char *const help_texts[Item_Count][2] = {
     [Item_Master]    = { "Turns the whole Discord status on or off.", "Discordステータス全体をオン/オフします。" },
@@ -121,6 +108,8 @@ static const char *const help_texts[Item_Count][2] = {
                          "ステータスの下にeショップのページを開くボタンを表示します。" },
     [Set_HbTag]      = { "Writes \"(homebrew)\" after forwarders and other non-eShop titles.",
                          "フォワーダーなどeショップにないソフトに「(homebrew)」と表記します。" },
+    [Set_BatterySaver] = { "Module fully idle in sleep (status cleared); checks less often on battery.",
+                         "スリープ中はモジュールを完全に休止し、バッテリー駆動中は確認の間隔を長くします。" },
     [Item_Login]     = { "Log in once with your phone - then it works on its own.",
                          "スマホで一度ログインするだけで、あとは自動で動作します。" },
     [Item_Test]      = { "Sends a test status to Discord and shows every step.",
@@ -129,13 +118,15 @@ static const char *const help_texts[Item_Count][2] = {
                          "フォワーダーのアイコンを今すぐアップロードします（表示されない場合の予備）。" },
     [Item_Diag]      = { "Versions, module state, log - send a photo if something's wrong.",
                          "バージョン・モジュールの状態・ログ。不具合のときは写真を送ってください。" },
+    [Item_Update]    = { "Downloads the newest version from GitHub and installs it.",
+                         "GitHubから最新版をダウンロードしてインストールします。" },
     [Item_Lang]      = { "English / 日本語", "English / 日本語" },
 };
 
 void ui_set_lang(Lang lang) { g_lang = lang; }
 Lang ui_lang(void) { return g_lang; }
 const char *tr(TextId id) { return strings[id][g_lang]; }
-const char *tr_setting(int s) { return setting_labels[s][g_lang]; }
+const char *tr_setting(int s) { return SETTING_LABELS[s][g_lang]; }
 const char *tr_help(int item) { return help_texts[item][g_lang]; }
 
 // --- SDL state -------------------------------------------------------------------
@@ -498,8 +489,8 @@ static void title_block(const char *title, const char *subtitle) {
 // one row: selection band + vermilion tick, label, optional On/Off on the right
 static void row(int x, int y, int w, bool selected, bool dim, const char *lbl, int state /* -1 none, 0 off, 1 on */) {
     if (selected) {
-        fill(x - 14, y - 4, w + 22, 30, (SDL_Color){ 255, 255, 255, 18 });
-        fill(x - 14, y - 4, 3, 30, C_Verm);
+        fill(x - 14, y - 3, w + 22, 28, (SDL_Color){ 255, 255, 255, 18 });
+        fill(x - 14, y - 3, 3, 28, C_Verm);
     }
     SDL_Color c = dim ? C_Dim : selected ? C_Ink : C_Text;
     text(x, y, F_Item, c, 0, lbl);
@@ -514,6 +505,8 @@ static void row(int x, int y, int w, bool selected, bool dim, const char *lbl, i
 
 void ui_menu(const MenuModel *m) {
     title_block(tr(T_Title), NULL);  // the name already says what it is
+    if (m->update_tag)
+        textf(X0, 92, F_Small, C_Verm, 0, tr(T_UpdateAvail), m->update_tag);
 
     // what's going on
     int y = 118;
@@ -545,16 +538,16 @@ void ui_menu(const MenuModel *m) {
     text(X0 + 92, y + 40, F_Small, on ? C_Text : C_Dim, 0, tr(on ? T_MasterOnDesc : T_MasterOffDesc));
 
     // what to show: two columns
-    y = 314;
+    y = 300;
     section(X0, y, X_END, tr(T_WhatToShow));
     for (int i = Item_FirstToggle; i <= Item_LastToggle; i++) {
         int k = i - Item_FirstToggle;
         int x = k < TOGGLE_ROWS ? X0 : COL2;
-        row(x, y + 32 + (k % TOGGLE_ROWS) * 32, COL_W, m->sel == i, !on, tr_setting(i), m->set[i]);
+        row(x, y + 30 + (k % TOGGLE_ROWS) * 30, COL_W, m->sel == i, !on, tr_setting(i), m->set[i]);
     }
 
     // account & tools
-    y = 514;
+    y = 516;
     section(X0, y, X_END, tr(T_AccountTools));
     for (int i = Item_Login; i < Item_Count; i++) {
         int k = i - Item_Login;
@@ -567,9 +560,13 @@ void ui_menu(const MenuModel *m) {
         case Item_Test:  snprintf(lbl, sizeof(lbl), "%s", tr(T_Test)); break;
         case Item_Icons: snprintf(lbl, sizeof(lbl), "%s", tr(T_Icons)); break;
         case Item_Diag:  snprintf(lbl, sizeof(lbl), "%s", tr(T_Diag)); break;
+        case Item_Update:
+            if (m->update_tag) snprintf(lbl, sizeof(lbl), tr(T_UpdateTo), m->update_tag);
+            else snprintf(lbl, sizeof(lbl), "%s", tr(T_Update));
+            break;
         default:         snprintf(lbl, sizeof(lbl), "%s", tr(T_Lang)); break;
         }
-        row(k % 2 ? COL2 : X0, y + 32 + (k / 2) * 32, COL_W, m->sel == i, false, lbl, -1);
+        row(k % 2 ? COL2 : X0, y + 30 + (k / 2) * 30, COL_W, m->sel == i, false, lbl, -1);
     }
 
     // a message for a moment after an action, otherwise what the selected item does

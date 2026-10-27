@@ -1,7 +1,8 @@
 name: Release
 
 # Push a tag like v1.0.0 (matching SWITCHRPC_VERSION in include/config.h):
-# CI builds the SD card zip and publishes a GitHub release with it.
+# CI builds the SD card zip and publishes a GitHub release with it, plus the
+# loose files and SHA256SUMS the app's "Check for updates" installs from.
 on:
   push:
     tags: ["v*"]
@@ -35,5 +36,10 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
-          files: out/switch-discord-activity-*.zip
+          files: |
+            out/switch-discord-activity-*.zip
+            out/exefs.nsp
+            out/switch-discord-activity.nro
+            out/switch-discord-activity.ovl
+            out/SHA256SUMS
           body_path: notes.md

@@ -4,6 +4,7 @@
 #include <string.h>
 #include <time.h>
 #include <string>
+#include <map>
 #include <sys/stat.h>
 
 // Include the main libnx system header, for Switch development
@@ -106,6 +107,7 @@ void __appInit(void)
 	g_pdmReady = R_SUCCEEDED(pdmqryInitialize());  // focus detection (HOME / eShop / ...)
 	g_ldrReady = R_SUCCEEDED(ldrDmntInitialize());  // album vs hbmenu
 	apmInitialize();                                  // docked / handheld
+	psmInitialize();                                  // charger (battery saver)
 
     // Close the service manager session.
     smExit();
@@ -126,6 +128,7 @@ void __appExit(void)
     if (g_pdmReady) pdmqryExit();
     if (g_ldrReady) ldrDmntExit();
     apmExit();
+    psmExit();
 
     discordDeleteHeadlessSession();
     writeToLog("[SwitchRPC] Sysmodule exiting. Goodbye!");
@@ -202,6 +205,11 @@ int main(int argc, char* argv[])
     // playtime of the current game: banked seconds + the running chunk
     u64 gameTid = 0;
     u64 played = 0;
+    // playtime of games we switched away from while they kept running (e.g.
+    // a quick visit to hbmenu), so coming back continues the timer
+    std::map<u64, u64> bank;
+    bool needCleanup = true;    // stale sessions from before a reboot / sleep
+    bool waitingForNet = false; // last post skipped: no internet
     u64 playStartRaw = 0;       // 0 = not counting (paused / no game)
     u64 screenStartRaw = 0;     // when a no-game screen (HOME, eShop...) was entered
 
@@ -216,6 +224,15 @@ int main(int argc, char* argv[])
     auto post = [&](const Want& w, bool refresh) {
         if (w.mode == Want_None)
             return;
+        if (!networkReady()) {
+            // never block on the network: note it and post as soon as it's back
+            postOk = false;
+            waitingForNet = true;
+            lastPostRaw = getRawNowSec();
+            writeStatus("error", "No internet connection - waiting for it");
+            return;
+        }
+        waitingForNet = false;
         if (w.mode == Want_Hidden) {
             discordDeleteHeadlessSession();
             postOk = true;
@@ -298,9 +315,14 @@ int main(int argc, char* argv[])
         }
         // a hidden game (settings) still keeps its playtime
         u64 newGame = (w.mode == Want_Play || w.mode == Want_Paused || w.mode == Want_Hidden) ? w.tid : 0;
-        if (newGame != gameTid) {              // other game (or none): fresh timer
+        if (newGame != gameTid) {
+            // hbmenu opened over a running game: keep the game's time for later
+            if (gameTid && gameTid != HOMEBREW_TID && newGame == HOMEBREW_TID)
+                bank[gameTid] = played;
             gameTid = newGame;
-            played = 0;
+            auto it = bank.find(newGame);
+            played = it != bank.end() ? it->second : 0;
+            if (it != bank.end()) bank.erase(it);
         }
         if (w.mode == Want_Play)
             playStartRaw = now;
@@ -312,11 +334,6 @@ int main(int argc, char* argv[])
         cur = w;
         post(w, false);
     };
-
-    // Start by cleaning up stale sessions
-    discordCleanupStaleSessions();
-
-    waitForNetworkReady();
 
     // register with psc and start the thread that watches for sleep/wake
     {
@@ -347,8 +364,7 @@ int main(int argc, char* argv[])
         if (g_wokeFromSleep) {
             g_wokeFromSleep = false;
             g_asleep = false;
-            waitForNetworkReady();
-            discordCleanupStaleSessions();
+            needCleanup = true;
             writeToLog("[SwitchRPC] Wake from sleep (PSC).");
             cur = Want();
             pending = Want();
@@ -376,6 +392,11 @@ int main(int argc, char* argv[])
             pending = Want();
         }
 
+        if (needCleanup && loggedIn && networkReady()) {
+            discordCleanupStaleSessions();
+            needCleanup = false;
+        }
+
         if (!g_asleep && loggedIn) {
             Want w;
             AppInfo info = {0};
@@ -400,7 +421,11 @@ int main(int argc, char* argv[])
                 w.tid = info.tid;
                 w.screen = sc;
                 memcpy(w.name, appName, sizeof(w.name));
+                // only one game runs at a time: forget banked time of closed ones
+                for (auto it = bank.begin(); it != bank.end();)
+                    it = it->first != info.tid ? bank.erase(it) : std::next(it);
             } else {
+                bank.clear();  // no game running
                 // no game: HOME menu (incl. settings, news...), eShop, user page...
                 Screen sc = album == Album_Real ? Screen_Album : getForegroundScreen(0);
                 if (sc == Screen_Game) sc = Screen_Home;
@@ -431,10 +456,8 @@ int main(int argc, char* argv[])
                 // or button press doesn't flicker the status - except the very
                 // first post and a newly launched game
                 bool newGame = w.mode == Want_Play && w.tid != cur.tid;
-                if (w == pending || cur.mode == Want_None || newGame) {
-                    waitForNetworkReady();
+                if (w == pending || cur.mode == Want_None || newGame)
                     apply(w);
-                }
                 pending = w;
             } else {
                 pending = w;
@@ -442,7 +465,7 @@ int main(int argc, char* argv[])
                 if (cur.mode == Want_Hidden) {
                     // nothing on Discord, nothing to keep alive
                 }
-                else if (!postOk && now - lastPostRaw >= 30) {
+                else if (!postOk && (now - lastPostRaw >= 30 || (waitingForNet && networkReady()))) {
                     writeToLog("[SwitchRPC] Retrying failed post.");
                     post(cur, false);
                 }
@@ -454,10 +477,18 @@ int main(int argc, char* argv[])
                 }
             }
         }
-        statusHeartbeat();
-
-        // check every 2s so a game switch / HOME press shows up quickly
-        waitSingle(waiterForUEvent(&g_pscWakeMain), 2ULL * 1000 * 1000 * 1000);
+        if (g_asleep && cfg.batterySaver && g_pscReady) {
+            // battery saver: the module does nothing at all while the console
+            // sleeps (it may still be woken for background downloads) - no
+            // polling, no SD writes - until the PSC thread reports the wake
+            waitSingle(waiterForUEvent(&g_pscWakeMain), UINT64_MAX);
+        } else {
+            statusHeartbeat();
+            // check every 2s so a game switch / HOME press shows up quickly;
+            // battery saver on battery: every 5s
+            u64 pollSec = cfg.batterySaver && onBattery() ? 5 : 2;
+            waitSingle(waiterForUEvent(&g_pscWakeMain), pollSec * 1000ULL * 1000 * 1000);
+        }
 
         // about to sleep or shut down, wifi still up - act now before we freeze,
         // stop polling until we wake, then let the psc thread ack
@@ -468,7 +499,11 @@ int main(int argc, char* argv[])
                 playStartRaw = 0;
             }
 
-            if (g_shuttingDown || gameTid == 0 || !isLoggedIn() || !cfg.enabled || !cfg.paused) {
+            if (!networkReady()) {
+                writeToLog("[SwitchRPC] Sleep/shutdown without internet - nothing to send.");
+            } else if (g_shuttingDown || gameTid == 0 || !isLoggedIn() || !cfg.enabled || !cfg.paused || cfg.batterySaver) {
+                // battery saver: one quick request and the radio can rest -
+                // no "paused" status that would need Discord to drop it later
                 writeToLog("[SwitchRPC] %s (PSC). Clearing Discord presence.", g_shuttingDown ? "Shutting down" : "Sleep imminent");
                 discordDeleteHeadlessSession();
             } else {
@@ -487,7 +522,8 @@ int main(int argc, char* argv[])
             }
             g_asleep = true;
             writeStatus("idle", g_shuttingDown ? "Console shutting down"
-                              : gameTid ? "Console asleep - shown as paused on Discord" : "Console asleep");
+                              : gameTid && !cfg.batterySaver && cfg.paused ? "Console asleep - shown as paused on Discord"
+                              : "Console asleep");
 
             ueventSignal(&g_sleepPrepDone);
         }

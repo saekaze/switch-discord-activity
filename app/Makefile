@@ -40,7 +40,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 TARGET		:=	switch-discord-activity
 APP_TITLE	:=	Switch Discord Activity
 APP_AUTHOR	:=	saekaze
-APP_VERSION	:=	$(shell sed -n 's/.*SWITCHRPC_VERSION "\(.*\)"/\1/p' $(CURDIR)/../include/config.h)
+APP_VERSION	:=	$(shell sed -n 's/.*SWITCHRPC_VERSION "\(.*\)"/\1/p' $(TOPDIR)/../include/config.h)
 ICON		:=	icon.jpg
 BUILD		:=	build
 SOURCES		:=	source

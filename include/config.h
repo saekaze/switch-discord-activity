@@ -1,7 +1,7 @@
 // Shared settings for the sysmodule and the app.
 #pragma once
 
-#define SWITCHRPC_VERSION "1.0.0"
+#define SWITCHRPC_VERSION "1.1.0"
 
 // Program id of the background module (atmosphere/contents/<id>/).
 // Same id as llsc12/SwitchRPC, so installing this replaces it instead of
@@ -13,3 +13,6 @@
 // (Discord Social SDK enabled, public client) changes them here.
 #define DISCORD_CLIENT_ID "1249119754522857616"
 #define AUTH_SHIM         "https://static.llsc12.me/discord"
+
+// Where the app looks for updates (GitHub releases).
+#define GITHUB_REPO "saekaze/switch-discord-activity"

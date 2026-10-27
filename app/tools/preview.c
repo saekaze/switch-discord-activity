@@ -1,5 +1,5 @@
 // Renders the app's screens on a PC (SDL offscreen) to check the layout. From app/:
-//   cc tools/preview.c source/ui.c source/qrcodegen.c -Isource $(sdl2-config --cflags --libs) -lSDL2_ttf -lSDL2_image -lm -o /tmp/preview
+//   cc tools/preview.c source/ui.c source/qrcodegen.c -Isource -I../include $(sdl2-config --cflags --libs) -lSDL2_ttf -lSDL2_image -lm -o /tmp/preview
 //   SDL_VIDEODRIVER=offscreen /tmp/preview out_dir
 #include <stdio.h>
 #include <string.h>
@@ -26,6 +26,18 @@ int main(int argc, char **argv) {
 
     for (int f = 0; f < 90; f++) { ui_frame_begin(); ui_menu(&m); ui_frame_end(); }
     shot(dir, "menu_en");
+
+    m.update_tag = "v1.1.0"; m.sel = Item_Update; m.set[Set_BatterySaver] = false;
+    ui_frame_begin(); ui_menu(&m); ui_frame_end();
+    shot(dir, "menu_update_en");
+    m.update_tag = NULL;
+    m.sel = Set_BatterySaver;
+    ui_frame_begin(); ui_menu(&m); ui_frame_end();
+    shot(dir, "menu_battery_en");
+    ui_set_lang(Lang_Ja);
+    ui_frame_begin(); ui_menu(&m); ui_frame_end();
+    shot(dir, "menu_battery_ja");
+    ui_set_lang(Lang_En);
 
     ui_set_lang(Lang_Ja);
     m.sel = Item_Lang; m.msg = NULL;

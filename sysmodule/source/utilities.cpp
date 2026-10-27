@@ -520,6 +520,7 @@ Settings loadSettings() {
         else if (!strcmp(key, "total_playtime")) st.totalPlaytime = on;
         else if (!strcmp(key, "eshop_button"))   st.eshopButton = on;
         else if (!strcmp(key, "homebrew_tag"))   st.homebrewTag = on;
+        else if (!strcmp(key, "battery_saver"))  st.batterySaver = on;
     }
     fclose(f);
     return st;
@@ -597,7 +598,20 @@ void statusHeartbeat() {
         flushStatus();
 }
 
-// blocks until network is ready, if ever. 
+// true when the console has a working internet connection right now
+bool networkReady() {
+    NifmInternetConnectionType type;
+    u32 strength;
+    NifmInternetConnectionStatus status;
+    return R_SUCCEEDED(nifmGetInternetConnectionStatus(&type, &strength, &status)) &&
+           status == NifmInternetConnectionStatus_Connected;
+}
+
+bool onBattery() {
+    PsmChargerType charger;
+    return R_SUCCEEDED(psmGetChargerType(&charger)) && charger == PsmChargerType_Unconnected;
+}
+
 void waitForNetworkReady() {
   writeToLog("[Network] Waiting for network to be ready...");
 

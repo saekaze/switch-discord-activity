@@ -8,6 +8,12 @@
 */
 void waitForNetworkReady();
 
+/// Internet connection up right now? (never blocks)
+bool networkReady();
+
+/// Running on battery: handheld without a charger.
+bool onBattery();
+
 /**
  * Looks up the eShop square icon URL for a title from Nintendo's EU search API.
  * Returns true and sets out_url on success, false if the title isn't found.
@@ -56,12 +62,14 @@ struct Settings {
     bool totalPlaytime = true;  ///< " · 152 h total"
     bool eshopButton = true;    ///< "Nintendo eShop" button for Switch games
     bool homebrewTag = true;    ///< "(homebrew)" for forwarders & co
+    bool batterySaver = false;  ///< sleep clears the status, slower polling on battery
 
     bool operator==(const Settings& o) const {
         return enabled == o.enabled && paused == o.paused && systemScreens == o.systemScreens &&
                timer == o.timer && icon == o.icon && gameName == o.gameName && pausedTime == o.pausedTime &&
                dockMode == o.dockMode && totalPlaytime == o.totalPlaytime &&
-               eshopButton == o.eshopButton && homebrewTag == o.homebrewTag;
+               eshopButton == o.eshopButton && homebrewTag == o.homebrewTag &&
+               batterySaver == o.batterySaver;
     }
     bool operator!=(const Settings& o) const { return !(*this == o); }
 };

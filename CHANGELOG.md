@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.1.0] - 2026-10-27
+
+### New
+- **Tesla overlay.** Every setting is now in the overlay menu too (`switch/.overlays/switch-discord-activity.ovl`), with the login and the current status at the top. Needs nx-ovlloader and Tesla Menu or Ultrahand. Changes made in the app and in the overlay show up in each other.
+- **Updates from the app.** The menu says when a newer release is out, and *Check for updates* downloads it from GitHub, checks it against `SHA256SUMS`, replaces the module, the app and the overlay, and restarts the module. Nothing is replaced unless every file checks out.
+- **Battery saver** (off by default). Sleep clears the status instead of showing *paused*, and the module does nothing at all until the console wakes up (no polling, no SD card writes, even when the console wakes up in the background for downloads). On battery it checks every 5 s instead of every 2 s.
+- **Prepare icons only handles new titles.** Titles done before (and titles with no icon of their own) are skipped without going online, so a second run takes seconds. Titles that failed are tried again next time.
+
+### Fixed
+- The module no longer waits for the network in a loop that blocked everything else: at boot, after sleep and before each post. Without internet it says so in the app and posts as soon as the connection is back.
+- Opening the Homebrew Menu over a running game and going back no longer restarts the game's timer.
+- Stale sessions that couldn't be deleted (no internet, Discord error) were forgotten and stayed on Discord. They are kept and deleted later.
+- Login and session expiry checks used the console clock instead of the corrected one, so a wrong clock could make a fresh token look expired (or the other way round).
+- A network hiccup while preparing icons made the app upload the title's own icon instead of using the eShop one.
+- Left/right in the bottom part of the menu jumped between rows.
+
 ## [1.0.0] - 2026-10-21
 
 First release. Based on [llsc12/SwitchRPC](https://github.com/llsc12/SwitchRPC).

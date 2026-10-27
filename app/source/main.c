@@ -26,6 +26,7 @@
 #include "config.h"
 #include "qrcodegen.h"
 #include "ui.h"
+#include "update.h"
 
 #define SYSMODULE_ID  SYSMODULE_TID
 #define TOKEN_PATH    "sdmc:/config/switchrpc_token"
@@ -359,7 +360,7 @@ static bool login_finish(Login *lg, char *user, size_t user_size) {
 
 // --- UI ------------------------------------------------------------------------
 
-typedef enum { Screen_Main, Screen_Login, Screen_Test, Screen_Icons, Screen_Diag } Screen;
+typedef enum { Screen_Main, Screen_Login, Screen_Test, Screen_Icons, Screen_Diag, Screen_Update } Screen;
 
 typedef struct {
     char fw[32], ams[32];
@@ -564,34 +565,9 @@ static int diag_lines(const Diag *d, const char **out) {
 
 // --- settings (sdmc:/config/switchrpc.ini, read by the module) ----------------
 
-#define SETTINGS_PATH "sdmc:/config/switchrpc.ini"
-
-// language: 0 = English, 1 = Japanese, -1 = not set yet (follow the console)
-static void load_settings(bool *v, int *lang) {
-    for (int i = 0; i < Set_Count; i++) v[i] = true;
-    *lang = -1;
-    FILE *f = fopen(SETTINGS_PATH, "r");
-    if (!f) return;
-    char line[128], key[64];
-    int val;
-    while (fgets(line, sizeof(line), f)) {
-        if (sscanf(line, " %63[a-z_] = %d", key, &val) != 2) continue;
-        if (!strcmp(key, "language")) *lang = val;
-        for (int i = 0; i < Set_Count; i++)
-            if (!strcmp(key, set_keys[i])) v[i] = val != 0;
-    }
-    fclose(f);
-}
 
 static void save_settings(const bool *v, Lang lang) {
-    mkdir("sdmc:/config", 0777);
-    FILE *f = fopen(SETTINGS_PATH, "w");
-    if (!f) return;
-    fprintf(f, "# Switch Discord Activity settings - change them in the Switch Discord Activity app\n");
-    for (int i = 0; i < Set_Count; i++)
-        fprintf(f, "%s=%d\n", set_keys[i], v[i] ? 1 : 0);
-    fprintf(f, "language=%d\n", lang == Lang_Ja ? 1 : 0);
-    fclose(f);
+    settings_save(v, lang == Lang_Ja ? 1 : 0);
 }
 
 static Lang console_lang(void) {
@@ -769,11 +745,13 @@ static void end_test(Test *t) {
 
 #define ESHOP_CACHE  "sdmc:/config/switchrpc-eshop-iconcache.json"
 #define UPLOAD_CACHE "sdmc:/config/switchrpc-uploaded-icons.json"
+// titles already looked at that have no icon to upload ("none")
+#define CHECKED_CACHE "sdmc:/config/switchrpc-icons-checked.json"
 
 typedef struct {
     char lines[24][96];
     int n;
-    int done, total, uploaded, failed;
+    int done, total, uploaded, failed, skipped, found;
 } IconJob;
 
 static void job_line(IconJob *j, const char *color, const char *fmt, ...) {
@@ -828,23 +806,29 @@ static bool url_is_image(const char *url) {
     return ok;
 }
 
-// Nintendo's EU eShop search, same query as the module
-static bool eshop_icon(const char *tid, char *out, size_t size) {
+// Nintendo's EU eShop search, same query as the module.
+// 1 = found, 0 = the eShop doesn't list it, -1 = couldn't ask (try again later)
+static int eshop_icon(const char *tid, char *out, size_t size) {
     char url[512];
     snprintf(url, sizeof(url),
              "https://searching.nintendo-europe.com/en/select?q=application_id_s%%3A%s&wt=json&fq=type%%3AGAME"
              "&fl=application_id_s%%2Cimage_url_sq_s&rows=5", tid);
     char err[128]; long code;
     char *resp = discord_req(url, "GET", NULL, NULL, NULL, &code, err, sizeof(err));
-    bool found = false;
-    json_object *root = resp ? json_tokener_parse(resp) : NULL, *r, *docs;
+    if (!resp || code != 200) {
+        free(resp);
+        return -1;
+    }
+    int found = 0;
+    json_object *root = json_tokener_parse(resp), *r, *docs;
+    if (!root) found = -1;
     if (root && json_object_object_get_ex(root, "response", &r) && json_object_object_get_ex(r, "docs", &docs)) {
         for (size_t i = 0; i < json_object_array_length(docs) && !found; i++) {
             json_object *doc = json_object_array_get_idx(docs, i);
             const char *id = jstr(doc, "application_id_s"), *img = jstr(doc, "image_url_sq_s");
             if (id && img && !strcasecmp(id, tid)) {
                 snprintf(out, size, "%s", img);
-                found = true;
+                found = 1;
             }
         }
     }
@@ -909,87 +893,144 @@ static bool upload_icon(const u8 *data, size_t len, bool catbox, char *out, size
     return ok;
 }
 
+// one title that isn't in any cache yet
+static void prepare_one(IconJob *j, u64 app_id, NsApplicationControlData *ctrl,
+                        json_object *eshop, json_object *uploads, json_object *checked) {
+    char tid[17];
+    snprintf(tid, sizeof(tid), "%016llx", (unsigned long long)app_id);
+    u64 actual = 0;
+    char name[64] = "?";
+    bool have_ctrl = R_SUCCEEDED(nsGetApplicationControlData(NsApplicationControlSource_Storage,
+                                 app_id, ctrl, sizeof(*ctrl), &actual));
+    if (have_ctrl) {
+        NacpLanguageEntry *le = NULL;
+        if (R_SUCCEEDED(nacpGetLanguageEntry(&ctrl->nacp, &le)) && le && le->name[0])
+            snprintf(name, sizeof(name), "%.40s", le->name);
+    }
+
+    char url[300], err[128] = "";
+    int es = eshop_icon(tid, url, sizeof(url));
+    if (es < 0) {
+        // don't mistake a network hiccup for "not in the eShop"
+        j->failed++;
+        job_line(j, "\x1b[33m", "%s: couldn't reach the eShop - tried again next time", name);
+        return;
+    }
+    if (es > 0) {
+        json_object_object_add(eshop, tid, json_object_new_string(url));
+        j->found++;
+        job_line(j, "\x1b[32m", "%s: eShop icon", name);
+        return;
+    }
+    char tf[80];
+    snprintf(tf, sizeof(tf), "https://tinfoil.media/ti/%016llX/512/512/", (unsigned long long)app_id);
+    if (url_is_image(tf)) {
+        json_object_object_add(eshop, tid, json_object_new_string(tf));
+        j->found++;
+        job_line(j, "\x1b[32m", "%s: tinfoil icon", name);
+        return;
+    }
+    if (!have_ctrl || actual <= sizeof(ctrl->nacp)) {
+        json_object_object_add(checked, tid, json_object_new_string("none"));
+        job_line(j, "\x1b[2m", "%s: has no icon of its own", name);
+        return;
+    }
+    size_t len = actual - sizeof(ctrl->nacp);
+    bool ok = upload_icon(ctrl->icon, len, false, url, sizeof(url), err, sizeof(err));
+    const char *host = "freeimage";
+    if (!ok) {
+        char err2[128];
+        ok = upload_icon(ctrl->icon, len, true, url, sizeof(url), err2, sizeof(err2));
+        host = "catbox";
+        if (!ok) { strncat(err, " / catbox: ", sizeof(err) - strlen(err) - 1);
+                   strncat(err, err2, sizeof(err) - strlen(err) - 1); }
+    }
+    if (ok) {
+        json_object_object_add(uploads, tid, json_object_new_string(url));
+        j->uploaded++;
+        job_line(j, "\x1b[32m", "%s: uploaded (%s)", name, host);
+    } else {
+        j->failed++;
+        job_line(j, "\x1b[31m", "%s: upload failed: %s", name, err);
+    }
+}
+
+// Goes through every installed title. Titles done before (any cache, or
+// known to have no icon) are skipped without touching the network, so a
+// second run only handles what was installed since.
 static void prepare_icons(IconJob *j, PadState *pad) {
     memset(j, 0, sizeof(*j));
     if (R_FAILED(nsInitialize())) {
         job_line(j, "\x1b[31m", "Can't open the title list (ns).");
         return;
     }
-    static NsApplicationRecord recs[512];
-    s32 count = 0;
-    nsListApplicationRecord(recs, 512, 0, &count);
-    j->total = count;
-
     json_object *eshop = cache_load(ESHOP_CACHE), *uploads = cache_load(UPLOAD_CACHE);
+    json_object *checked = cache_load(CHECKED_CACHE);
     NsApplicationControlData *ctrl = malloc(sizeof(*ctrl));
 
-    for (s32 i = 0; i < count && ctrl; i++) {
-        padUpdate(pad);
-        if (padGetButtonsDown(pad) & HidNpadButton_B) { job_line(j, "\x1b[33m", "Stopped."); break; }
-
-        char tid[17];
-        snprintf(tid, sizeof(tid), "%016llx", (unsigned long long)recs[i].application_id);
-        u64 actual = 0;
-        char name[64] = "?";
-        bool have_ctrl = R_SUCCEEDED(nsGetApplicationControlData(NsApplicationControlSource_Storage,
-                                     recs[i].application_id, ctrl, sizeof(*ctrl), &actual));
-        if (have_ctrl) {
-            NacpLanguageEntry *le = NULL;
-            if (R_SUCCEEDED(nacpGetLanguageEntry(&ctrl->nacp, &le)) && le && le->name[0])
-                snprintf(name, sizeof(name), "%.40s", le->name);
-        }
-        j->done = i + 1;
-
-        json_object *tmp;
-        if (json_object_object_get_ex(eshop, tid, &tmp) || json_object_object_get_ex(uploads, tid, &tmp)) {
-            job_line(j, "", "%s: cached", name);
-        } else {
-            char url[300], err[128] = "";
-            draw_icons(j, false);
-            if (eshop_icon(tid, url, sizeof(url))) {
-                json_object_object_add(eshop, tid, json_object_new_string(url));
-                job_line(j, "\x1b[32m", "%s: eShop icon", name);
-            } else {
-                char tf[80];
-                snprintf(tf, sizeof(tf), "https://tinfoil.media/ti/%016llX/512/512/", (unsigned long long)recs[i].application_id);
-                if (url_is_image(tf)) {
-                    json_object_object_add(eshop, tid, json_object_new_string(tf));
-                    job_line(j, "\x1b[32m", "%s: tinfoil icon", name);
-                } else if (!have_ctrl || actual <= sizeof(ctrl->nacp)) {
-                    j->failed++;
-                    job_line(j, "\x1b[31m", "%s: has no icon of its own", name);
-                } else {
-                    size_t len = actual - sizeof(ctrl->nacp);
-                    bool ok = upload_icon(ctrl->icon, len, false, url, sizeof(url), err, sizeof(err));
-                    const char *host = "freeimage";
-                    if (!ok) {
-                        char err2[128];
-                        ok = upload_icon(ctrl->icon, len, true, url, sizeof(url), err2, sizeof(err2));
-                        host = "catbox";
-                        if (!ok) { strncat(err, " / catbox: ", sizeof(err) - strlen(err) - 1);
-                                   strncat(err, err2, sizeof(err) - strlen(err) - 1); }
-                    }
-                    if (ok) {
-                        json_object_object_add(uploads, tid, json_object_new_string(url));
-                        j->uploaded++;
-                        job_line(j, "\x1b[32m", "%s: uploaded (%s) %s", name, host, url);
-                    } else {
-                        j->failed++;
-                        job_line(j, "\x1b[31m", "%s: upload failed: %s", name, err);
-                    }
-                }
+    static NsApplicationRecord recs[64];
+    s32 offset = 0, count = 0;
+    bool stop = false;
+    job_line(j, "", "Checking installed titles...");
+    while (ctrl && !stop && R_SUCCEEDED(nsListApplicationRecord(recs, 64, offset, &count)) && count > 0) {
+        for (s32 i = 0; i < count && !stop; i++) {
+            padUpdate(pad);
+            if (padGetButtonsDown(pad) & HidNpadButton_B) { job_line(j, "\x1b[33m", "Stopped."); stop = true; break; }
+            j->total++;
+            j->done++;
+            char tid[17];
+            snprintf(tid, sizeof(tid), "%016llx", (unsigned long long)recs[i].application_id);
+            json_object *tmp;
+            if (json_object_object_get_ex(eshop, tid, &tmp) || json_object_object_get_ex(uploads, tid, &tmp) ||
+                json_object_object_get_ex(checked, tid, &tmp)) {
+                j->skipped++;
+                continue;
             }
+            draw_icons(j, false);
+            prepare_one(j, recs[i].application_id, ctrl, eshop, uploads, checked);
             // save as we go, so stopping halfway keeps what's done
             json_object_to_file_ext(ESHOP_CACHE, eshop, JSON_C_TO_STRING_PLAIN);
             json_object_to_file_ext(UPLOAD_CACHE, uploads, JSON_C_TO_STRING_PLAIN);
+            json_object_to_file_ext(CHECKED_CACHE, checked, JSON_C_TO_STRING_PLAIN);
+            draw_icons(j, false);
         }
-        draw_icons(j, false);
+        offset += count;
     }
     free(ctrl);
     json_object_put(eshop);
     json_object_put(uploads);
+    json_object_put(checked);
     nsExit();
-    job_line(j, "\x1b[1m", "Done. The module uses these right away (no reboot needed).");
+
+    int fresh = j->total - j->skipped;
+    if (fresh == 0)
+        job_line(j, "\x1b[32m", "All %d titles already have their icons - nothing new to do.", j->total);
+    else
+        job_line(j, "\x1b[1m", "Done: %d new (%d uploaded, %d found), %d already done before, %d to retry later.",
+                 fresh, j->uploaded, j->found, j->skipped, j->failed);
+    if (j->failed == 0 && fresh > 0)
+        job_line(j, "", "The module uses these right away (no reboot needed).");
+}
+
+// ---- update ---------------------------------------------------------------------
+
+static void draw_update(const IconJob *j, bool finished) {
+    const char *lines[24];
+    for (int i = 0; i < j->n; i++) lines[i] = j->lines[i];
+    ui_frame_begin();
+    ui_lines(tr(T_UpdateTitle), lines, j->n, finished ? tr(T_FooterBack) : tr(T_FooterWorking));
+    ui_frame_end();
+}
+
+// progress lines from update_install, drawn as they come
+static void update_line(void *ctx, const char *color, const char *fmt, ...) {
+    char buf[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    job_line(ctx, color, "%s", buf);
+    draw_update(ctx, false);
 }
 
 static void draw_login(const Login *lg, const char *note) {
@@ -1013,9 +1054,10 @@ static int move_sel(int sel, u64 down) {
         k = r ? k + TOGGLE_ROWS : k - TOGGLE_ROWS;
         if (k >= 0 && k < n) return Item_FirstToggle + k;
     } else if (sel >= Item_Login) {
+        // two columns, filled row by row: stay on the same row
         int k = sel - Item_Login;
-        k = r ? k + 1 : k - 1;
-        if (k >= 0 && Item_Login + k < Item_Count) return Item_Login + k;
+        if (r && k % 2 == 0 && Item_Login + k + 1 < Item_Count) return sel + 1;
+        if (l && k % 2 == 1) return sel - 1;
     }
     return sel;
 }
@@ -1027,13 +1069,15 @@ int main(int argc, char **argv) {
 
     socketInitializeDefault();
     curl_global_init(CURL_GLOBAL_DEFAULT);
+    if (argc > 0) update_set_nro_path(argv[0]);
+    update_check_async();  // tells the menu if there's a newer release
     bool have_nifm = R_SUCCEEDED(nifmInitialize(NifmServiceType_User));
     bool have_pm   = R_SUCCEEDED(pmdmntInitialize());
     timeInitialize();
 
     bool set[Set_Count];
     int lang_setting;
-    load_settings(set, &lang_setting);
+    settings_load(set, &lang_setting);
     Lang lang = lang_setting < 0 ? console_lang() : lang_setting == 1 ? Lang_Ja : Lang_En;
     if (!ui_init(lang)) {
         // no graphics (shouldn't happen): leave quietly instead of crashing
@@ -1066,7 +1110,7 @@ int main(int argc, char **argv) {
     Screen screen = Screen_Main;
     Login lg = { .fd = -1 };
     static Test test;
-    static IconJob icon_job;
+    static IconJob icon_job, update_job;
     int sel = Item_Master;
     u64 frame = 0;
 
@@ -1118,13 +1162,17 @@ int main(int argc, char **argv) {
                     prepare_icons(&icon_job, &pad);
                 } else if (sel == Item_Diag) {
                     screen = Screen_Diag;
+                } else if (sel == Item_Update) {
+                    screen = Screen_Update;
+                    memset(&update_job, 0, sizeof(update_job));
+                    update_install(update_line, &update_job);
                 }
                 frame = 0;  // refresh the state right away
             }
         } else if (screen == Screen_Diag) {
             if (down & (HidNpadButton_B | HidNpadButton_Plus)) { screen = Screen_Main; frame = 0; }
             if (down & HidNpadButton_Y) { start_module(&d); frame = 0; }
-        } else if (screen == Screen_Icons) {
+        } else if (screen == Screen_Icons || screen == Screen_Update) {
             if (down & (HidNpadButton_B | HidNpadButton_Plus)) { screen = Screen_Main; frame = 0; }
         } else if (screen == Screen_Test) {
             if (down & (HidNpadButton_B | HidNpadButton_Plus)) { end_test(&test); screen = Screen_Main; frame = 0; }
@@ -1176,6 +1224,8 @@ int main(int argc, char **argv) {
             m.sel = sel;
             m.msg = show_msg ? msg : NULL;
             m.msg_tone = msg_tone;
+            const UpdateInfo *upd = update_info();
+            m.update_tag = upd->done && upd->available ? upd->latest : NULL;
             if (!ui_frame_begin()) goto done;
             ui_menu(&m);
             ui_frame_end();
@@ -1191,6 +1241,7 @@ int main(int argc, char **argv) {
         }
         case Screen_Test:  draw_test(&test, true); break;
         case Screen_Icons: draw_icons(&icon_job, true); break;
+        case Screen_Update: draw_update(&update_job, true); break;
         case Screen_Login: draw_login(&lg, NULL); break;
         }
         frame++;  // vsync paces the loop at 60 fps
@@ -1200,6 +1251,7 @@ done:
     login_stop(&lg);
     end_test(&test);
     ui_exit();
+    update_exit();
     if (have_pm)   pmdmntExit();
     if (have_nifm) nifmExit();
     curl_global_cleanup();

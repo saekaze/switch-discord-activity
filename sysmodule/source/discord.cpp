@@ -281,7 +281,7 @@ bool refreshAuthTokenIfNeeded() {
     }
 
     // check if the auth token is expired or will expire in the next 5 minutes
-    if (time(NULL) < authTokenExpiry - 300) { 
+    if ((time_t)getCorrectedNowSec() < authTokenExpiry - 300) { 
         writeToLog("[Discord] Auth token is still valid.");
         return true;
     }
@@ -371,11 +371,12 @@ void discordCleanupStaleSessions() {
     file.close();
 
     if (!sessionToken.empty() && uniqueTokens.count(sessionToken) > 0) {
-        if (time(NULL) < sessionTokenExpiry) {
+        if ((time_t)getCorrectedNowSec() < sessionTokenExpiry) {
             uniqueTokens.erase(sessionToken);
         }
     }
     
+    std::set<std::string> failed;  // kept for the next cleanup
     for (const std::string& token : uniqueTokens) {
         json_object* json_body = json_object_new_object();
         json_object_object_add(json_body, "token", json_object_new_string(token.c_str()));
@@ -385,15 +386,21 @@ void discordCleanupStaleSessions() {
         headers = curl_slist_append(headers, "Content-Type: application/json; charset=utf-8");
 
         writeToLog("[Discord] Deleting stale headless session...");
-        authenticatedRequest("https://gaming-sdk.com/api/v9/users/@me/headless-sessions/delete", "POST", headers, body, NULL);
+        bool ok = authenticatedRequest("https://gaming-sdk.com/api/v9/users/@me/headless-sessions/delete", "POST", headers, body, NULL);
+        // 4xx = Discord doesn't know it (already gone): nothing left to delete
+        if (!ok && (g_lastHttpCode == 0 || g_lastHttpCode >= 500))
+            failed.insert(token);
 
         json_object_put(json_body);
     }
-    
-    if (remove("sdmc:/config/switchrpc_sessions") == 0) {
-        writeToLog("[Discord] Successfully removed sessions file.");
+
+    remove("sdmc:/config/switchrpc_sessions");
+    if (!failed.empty()) {
+        std::ofstream out("sdmc:/config/switchrpc_sessions", std::ios::trunc);
+        for (const std::string& t : failed) out << t << std::endl;
+        writeToLog("[Discord] %d stale session(s) couldn't be deleted, will retry.", (int)failed.size());
     } else {
-        writeToLog("[Discord] Failed to remove sessions file after cleanup.");
+        writeToLog("[Discord] Stale sessions cleaned up.");
     }
 }
 

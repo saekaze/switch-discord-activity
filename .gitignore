@@ -9,3 +9,4 @@ build/
 *.nacp
 *.map
 *.lst
+*.ovl

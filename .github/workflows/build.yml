@@ -22,4 +22,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: switch-discord-activity-${{ github.sha }}
-          path: out/switch-discord-activity-*.zip
+          path: |
+            out/switch-discord-activity-*.zip
+            out/SHA256SUMS
