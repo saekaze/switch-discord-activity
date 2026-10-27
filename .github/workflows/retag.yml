@@ -9,9 +9,17 @@ jobs:
   retag:
     runs-on: ubuntu-latest
     steps:
-      - name: Move the tags
+      - name: Re-create the tags on the cleaned commits
         env:
           GH_TOKEN: ${{ github.token }}
+          R: ${{ github.repository }}
         run: |
-          gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/v1.0.0" -f sha=3226d4ff4a94585fd104ef96b0e7c3ca33367a5c -F force=true
-          gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/v1.1.0" -f sha=735b943ba3de48b47bb8fab09a575d15908c99f2 -F force=true
+          set -e
+          move() {
+            id=$(gh api "repos/$R/releases/tags/$1" --jq .id)
+            gh api -X DELETE "repos/$R/git/refs/tags/$1"
+            gh api "repos/$R/git/refs" -f ref="refs/tags/$1" -f sha="$2"
+            gh api -X PATCH "repos/$R/releases/$id" -f tag_name="$1" -F draft=false -f make_latest="$3"
+          }
+          move v1.0.0 3226d4ff4a94585fd104ef96b0e7c3ca33367a5c false
+          move v1.1.0 735b943ba3de48b47bb8fab09a575d15908c99f2 true
