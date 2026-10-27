@@ -148,9 +148,9 @@ The rest of the repo:
 
 **Making a release:**
 1. Bump `SWITCHRPC_VERSION` in `include/config.h` and add a `CHANGELOG.md` entry.
-2. Push a tag `vX.Y.Z`.
+2. Push to `main` (or push a tag `vX.Y.Z`).
 
-GitHub Actions then builds the zip and publishes the release, with `exefs.nsp`, the `.nro`, the `.ovl` and `SHA256SUMS` next to it for the in-app updater.
+If that version isn't released yet, GitHub Actions builds the zip and publishes the release, with `exefs.nsp`, the `.nro`, the `.ovl` and `SHA256SUMS` next to it for the in-app updater.
 
 ## Credits
 
