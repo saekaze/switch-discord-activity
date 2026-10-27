@@ -1,0 +1,17 @@
+name: Move tags (one-time)
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/retag.yml]
+permissions:
+  contents: write
+jobs:
+  retag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Move the tags
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/v1.0.0" -f sha=3226d4ff4a94585fd104ef96b0e7c3ca33367a5c -F force=true
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/v1.1.0" -f sha=735b943ba3de48b47bb8fab09a575d15908c99f2 -F force=true
