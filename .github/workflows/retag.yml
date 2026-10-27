@@ -9,17 +9,14 @@ jobs:
   retag:
     runs-on: ubuntu-latest
     steps:
-      - name: Re-create the tags on the cleaned commits
+      - name: Delete v1.1.0, republish both releases on the cleaned commits
         env:
           GH_TOKEN: ${{ github.token }}
           R: ${{ github.repository }}
         run: |
-          set -e
-          move() {
-            id=$(gh api "repos/$R/releases/tags/$1" --jq .id)
-            gh api -X DELETE "repos/$R/git/refs/tags/$1"
-            gh api "repos/$R/git/refs" -f ref="refs/tags/$1" -f sha="$2"
-            gh api -X PATCH "repos/$R/releases/$id" -f tag_name="$1" -F draft=false -f make_latest="$3"
-          }
-          move v1.0.0 3226d4ff4a94585fd104ef96b0e7c3ca33367a5c false
-          move v1.1.0 735b943ba3de48b47bb8fab09a575d15908c99f2 true
+          gh api -X DELETE "repos/$R/git/refs/tags/v1.1.0" || true
+          for t in "v1.0.0 3226d4ff4a94585fd104ef96b0e7c3ca33367a5c false" "v1.1.0 735b943ba3de48b47bb8fab09a575d15908c99f2 true"; do
+            set -- $t
+            id=$(gh api "repos/$R/releases" --jq ".[] | select(.tag_name==\"$1\") | .id")
+            gh api -X PATCH "repos/$R/releases/$id" -f tag_name="$1" -f target_commitish="$2" -F draft=false -f make_latest="$3" || echo "::warning::publish $1 by hand"
+          done
