@@ -17,6 +17,11 @@
 #include <json-c/json.h>
 #include "config.h"
 
+// The app can't always replace its own .nro while it runs: then the new one
+// stays as "<nro>.new", this file says where, and the background module
+// swaps it in at the next boot (when the app can't be open).
+#define PENDING_NRO "sdmc:/config/switchrpc-pending-nro"
+
 #define API_LATEST "https://api.github.com/repos/" GITHUB_REPO "/releases/latest"
 #define UA "switch-discord-activity/" SWITCHRPC_VERSION
 
@@ -274,23 +279,23 @@ bool update_install(UpdateLine line, void *ctx) {
         json_object_put(root);
         return false;
     }
-    const char *latest = json_object_get_string(tag);
+    char latest[32];
+    snprintf(latest, sizeof(latest), "%s", json_object_get_string(tag));
     line(ctx, "", "   Installed v%s, latest %s", SWITCHRPC_VERSION, latest);
-    if (!newer(latest, SWITCHRPC_VERSION)) {
-        line(ctx, "\x1b[32m", "   You already have the latest version.");
-        json_object_put(root);
-        return true;
-    }
+    // same version: only put back files that are missing (e.g. the overlay
+    // when an older updater couldn't finish)
+    bool repair = !newer(latest, SWITCHRPC_VERSION);
 
     char nsp_dir[96], nsp[128];
     snprintf(nsp_dir, sizeof(nsp_dir), "sdmc:/atmosphere/contents/%016llX", (unsigned long long)SYSMODULE_TID);
     snprintf(nsp, sizeof(nsp), "%s/exefs.nsp", nsp_dir);
+    // the app's own .nro last: it's the one that may not be replaceable
     Part parts[] = {
         { "exefs.nsp", nsp, false, "" },
-        { "switch-discord-activity.nro", g_nro_path, false, "" },
         { "switch-discord-activity.ovl", "sdmc:/switch/.overlays/switch-discord-activity.ovl", false, "" },
+        { "switch-discord-activity.nro", g_nro_path, false, "" },
     };
-    const int nparts = sizeof(parts) / sizeof(parts[0]);
+    const int nparts = sizeof(parts) / sizeof(parts[0]), NRO = nparts - 1;
     char sums_url[512] = "";
     for (size_t i = 0; i < json_object_array_length(assets); i++) {
         json_object *a = json_object_array_get_idx(assets, i), *n, *u;
@@ -305,10 +310,24 @@ bool update_install(UpdateLine line, void *ctx) {
             }
     }
     json_object_put(root);
-    if (!sums_url[0] || !parts[0].present || !parts[1].present) {
+    if (!sums_url[0] || !parts[0].present || !parts[NRO].present) {
         line(ctx, "\x1b[31m", "   This release has no files for automatic updates.");
         line(ctx, "", "   Download the zip from github.com/%s/releases instead.", GITHUB_REPO);
         return false;
+    }
+
+    if (repair) {
+        int missing = 0;
+        for (int k = 0; k < nparts; k++) {
+            if (parts[k].present && access(parts[k].target, F_OK) == 0)
+                parts[k].present = false;  // already there
+            missing += parts[k].present;
+        }
+        if (!missing) {
+            line(ctx, "\x1b[32m", "   You already have the latest version.");
+            return true;
+        }
+        line(ctx, "", "   Same version, but %d file(s) are missing - putting them back.", missing);
     }
 
     char *sums = http_get(sums_url, NULL, err, sizeof(err));
@@ -346,13 +365,26 @@ bool update_install(UpdateLine line, void *ctx) {
     }
     free(sums);
 
+    bool nro_pending = false;
     for (int k = 0; k < nparts; k++) {
         if (!parts[k].present) continue;
         char tmp[300];
         snprintf(tmp, sizeof(tmp), "%s.new", parts[k].target);
         if (!ok) { remove(tmp); continue; }
+        if (k == NRO) {
+            // the running app keeps its own .nro open for its images (romfs);
+            // they're all loaded by now, so let go of the file first
+            romfsExit();
+        }
         remove(parts[k].target);  // FAT can't rename over an existing file
-        if (rename(tmp, parts[k].target) != 0) {
+        if (rename(tmp, parts[k].target) == 0)
+            continue;
+        if (k == NRO) {
+            // still locked: the module finishes this at the next boot
+            FILE *f = fopen(PENDING_NRO, "w");
+            if (f) { fprintf(f, "%s\n", parts[k].target); fclose(f); }
+            nro_pending = true;
+        } else {
             line(ctx, "\x1b[31m", "   Couldn't replace %s.", parts[k].target);
             ok = false;
         }
@@ -370,9 +402,20 @@ bool update_install(UpdateLine line, void *ctx) {
         if (f) fclose(f);
     }
 
+    if (repair) {
+        line(ctx, "\x1b[32m", "Missing files restored.");
+        g_info.available = false;
+        return true;
+    }
     line(ctx, "\x1b[32m", "Updated to %s.", latest);
-    restart_module(line, ctx);
-    line(ctx, "\x1b[33m", "Restart this app (press + and open it again) to use the new version.");
+    if (nro_pending) {
+        // the module swaps the app at its next start, which must be a boot
+        // (a restart now would find the app still open) - so don't restart it
+        line(ctx, "\x1b[33m", "Restart the console to finish: the app can't replace itself while open.");
+    } else {
+        restart_module(line, ctx);
+        line(ctx, "\x1b[33m", "Restart this app (press + and open it again) to use the new version.");
+    }
     g_info.available = false;
     return true;
 }

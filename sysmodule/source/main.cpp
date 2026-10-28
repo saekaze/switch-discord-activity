@@ -185,10 +185,71 @@ static std::string hms(u64 sec) {
     return buf;
 }
 
+// A whole .nro: header, then the asset section (icon, nacp, romfs) right
+// behind the code. Catches a download that was cut off.
+static bool nroComplete(const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return false;
+    u8 hdr[0x20], aset[0x38];
+    bool ok = fread(hdr, 1, sizeof(hdr), f) == sizeof(hdr) && !memcmp(hdr + 0x10, "NRO0", 4);
+    u32 size = 0;
+    if (ok) memcpy(&size, hdr + 0x18, 4);
+    ok = ok && fseek(f, size, SEEK_SET) == 0 && fread(aset, 1, sizeof(aset), f) == sizeof(aset) &&
+         !memcmp(aset, "ASET", 4);
+    u64 end = size;
+    for (int i = 0; ok && i < 3; i++) {  // icon, nacp, romfs: offset + size from the asset header
+        u64 off, len;
+        memcpy(&off, aset + 8 + i * 16, 8);
+        memcpy(&len, aset + 16 + i * 16, 8);
+        if (len && size + off + len > end) end = size + off + len;
+    }
+    ok = ok && fseek(f, 0, SEEK_END) == 0 && (u64)ftell(f) >= end;
+    fclose(f);
+    return ok;
+}
+
+// The app's updater can't replace the app's own .nro while it's open: it
+// leaves "<nro>.new" (checked against SHA256SUMS) and writes the path to
+// PENDING_NRO. The app can't be open at boot, so finish the swap here.
+// (The 1.1.0 updater left the .new without the path file.)
+#define PENDING_NRO "sdmc:/config/switchrpc-pending-nro"
+static void finishAppUpdate() {
+    char target[300] = "sdmc:/switch/switch-discord-activity.nro";
+    if (FILE* f = fopen(PENDING_NRO, "r")) {
+        char line[300];
+        if (fgets(line, sizeof(line), f)) {
+            line[strcspn(line, "\r\n")] = '\0';
+            if (!strncmp(line, "sdmc:/", 6)) snprintf(target, sizeof(target), "%s", line);
+        }
+        fclose(f);
+    }
+    char tmp[310];
+    snprintf(tmp, sizeof(tmp), "%s.new", target);
+    struct stat st;
+    if (stat(tmp, &st) != 0) {
+        remove(PENDING_NRO);
+        return;
+    }
+    if (!nroComplete(tmp)) {
+        writeToLog("[SwitchRPC] %s is incomplete, deleting it (update the app again).", tmp);
+        remove(tmp);
+        remove(PENDING_NRO);
+        return;
+    }
+    remove(target);
+    if (rename(tmp, target) == 0) {
+        remove(PENDING_NRO);
+        writeToLog("[SwitchRPC] Finished updating the app: %s", target);
+    } else {
+        writeToLog("[SwitchRPC] Couldn't finish updating the app (is it open?), trying again next boot.");
+    }
+}
+
 int main(int argc, char* argv[])
 {
     writeToLog("[SwitchRPC] Sysmodule v%s started successfully.", SWITCHRPC_VERSION);
     mkdir("sdmc:/config", 0777);
+    finishAppUpdate();
     if (!isLoggedIn())
         writeToLog("[SwitchRPC] Not logged in yet - open the Switch Discord Activity app and log in.");
     if (!g_pdmReady)

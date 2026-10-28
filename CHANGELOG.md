@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.1.4] - 2026-10-28
+
+### Fixed
+- **Check for updates** stopped with "Couldn't replace ...switch-discord-activity.nro": the app can't replace its own file while it's open. It now lets go of the file first, and if the console still keeps it locked, the new app waits next to it and the background module swaps it in at the next boot (after checking the file is complete).
+- The updater installs the app's own file last, and on the same version it puts back missing files (for example the overlay, if an older updater couldn't finish).
+- The updater printed the version from memory it had already freed.
+
+### Updating from 1.1.0 - 1.1.3
+1. **Check for updates** in the app (it may show the same error again - that's expected).
+2. Restart the console: the new module finishes updating the app.
+3. Open the app and **Check for updates** once more to add the overlay.
+
 ## [1.1.3] - 2026-10-28
 
 ### Fixed
