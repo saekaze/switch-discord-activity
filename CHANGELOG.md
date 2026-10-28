@@ -2,6 +2,8 @@
 
 ## [1.1.4] - 2026-10-28
 
+> **Coming from 1.1.0 - 1.1.3? Restart the console after "Check for updates".** Those versions can't replace the app while it's open; the new background module finishes the update at the next boot. Steps below.
+
 ### Fixed
 - **Check for updates** stopped with "Couldn't replace ...switch-discord-activity.nro": the app can't replace its own file while it's open. It now lets go of the file first, and if the console still keeps it locked, the new app waits next to it and the background module swaps it in at the next boot (after checking the file is complete).
 - The updater installs the app's own file last, and on the same version it puts back missing files (for example the overlay, if an older updater couldn't finish).

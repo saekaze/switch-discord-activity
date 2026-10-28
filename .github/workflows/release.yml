@@ -35,8 +35,12 @@ jobs:
             echo "tag $GITHUB_REF_NAME != v$v in include/config.h"; exit 1
           fi
           if gh release view "v$v" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "v$v is already released"
+            echo "v$v is already released - refreshing its notes from CHANGELOG.md"
             echo "release=false" >> "$GITHUB_OUTPUT"
+            awk -v v="$v" '$0 ~ "^## \\[?"v"\\]?" {on=1; next} /^## / && on {exit} on' CHANGELOG.md > notes.md
+            if [ -s notes.md ]; then
+              gh release edit "v$v" --repo "$GITHUB_REPOSITORY" --notes-file notes.md || echo "::warning::couldn't update the release notes"
+            fi
           else
             echo "release=true" >> "$GITHUB_OUTPUT"
           fi

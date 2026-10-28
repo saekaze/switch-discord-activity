@@ -38,6 +38,8 @@ That's it. Start a game, and it shows up on Discord within a few seconds. You do
 
 **Updating:** open the app and choose **Check for updates** (the menu also tells you when there's a new version). It downloads the new module, app and overlay from GitHub and restarts the module. From 1.0.0, update once by hand with the zip.
 
+> **From 1.1.0 - 1.1.3 to 1.1.4 or newer: restart the console.** Those versions can't replace the app while it's open, so *Check for updates* may end with "Couldn't replace ... .nro". That's expected: restart the console and the new background module finishes the update. Then open the app and *Check for updates* once more to add the overlay.
+
 **Not showing up?** In Discord, open *Settings → Activity Privacy* and turn on sharing your activity.
 
 ## The menu
