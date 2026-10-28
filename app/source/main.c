@@ -360,7 +360,7 @@ static bool login_finish(Login *lg, char *user, size_t user_size) {
 
 // --- UI ------------------------------------------------------------------------
 
-typedef enum { Screen_Main, Screen_Login, Screen_Test, Screen_Icons, Screen_Diag, Screen_Update } Screen;
+typedef enum { Screen_Main, Screen_Login, Screen_Test, Screen_IconsAsk, Screen_Icons, Screen_Diag, Screen_Update } Screen;
 
 typedef struct {
     char fw[32], ams[32];
@@ -745,8 +745,8 @@ static void end_test(Test *t) {
 // --- "Prepare icons" (L): icons for forwarders & co, uploaded once ------------
 //
 // Discord only shows images by URL. For every installed title no icon
-// database knows, the app uploads the title's own icon (freeimage.host,
-// catbox.moe as a fallback) and writes the link to the cache the module
+// database knows, the app uploads the title's own icon (catbox.moe,
+// freeimage.host as a fallback) and writes the link to the cache the module
 // reads - so the module never has to upload anything itself.
 
 #define ESHOP_CACHE  "sdmc:/config/switchrpc-eshop-iconcache.json"
@@ -757,7 +757,7 @@ static void end_test(Test *t) {
 typedef struct {
     char lines[24][200];
     int n;
-    int done, total, uploaded, failed, skipped, found;
+    int done, total, uploaded, failed, skipped, found, repaired;
 } IconJob;
 
 static void job_line(IconJob *j, const char *color, const char *fmt, ...) {
@@ -816,6 +816,31 @@ static bool url_is_image(const char *url) {
     }
     curl_easy_cleanup(c);
     return ok;
+}
+
+// Is a saved icon link still there? 1 = yes, 0 = gone (404/410), -1 = can't
+// tell (offline, host down). A real download of the first bytes: catbox
+// answers a HEAD request with 200 even for files that don't exist.
+static int link_alive(const char *url) {
+    CURL *c = curl_easy_init();
+    if (!c) return -1;
+    curl_easy_setopt(c, CURLOPT_URL, url);
+    curl_easy_setopt(c, CURLOPT_RANGE, "0-1023");
+    curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, 0L);
+    curl_easy_setopt(c, CURLOPT_SSL_VERIFYHOST, 0L);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, 10L);
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, sink);
+    int r = -1;
+    if (curl_easy_perform(c) == CURLE_OK) {
+        long code = 0; char *type = NULL;
+        curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
+        curl_easy_getinfo(c, CURLINFO_CONTENT_TYPE, &type);
+        if ((code == 200 || code == 206) && type && !strncmp(type, "image/", 6)) r = 1;
+        else if (code == 404 || code == 410) r = 0;
+    }
+    curl_easy_cleanup(c);
+    return r;
 }
 
 // Nintendo's EU eShop search, same query as the module.
@@ -944,13 +969,15 @@ static void prepare_one(IconJob *j, u64 app_id, NsApplicationControlData *ctrl,
         return;
     }
     size_t len = actual - sizeof(ctrl->nacp);
-    bool ok = upload_icon(ctrl->icon, len, false, url, sizeof(url), err, sizeof(err));
-    const char *host = "freeimage";
+    // catbox first: it keeps files as long as they're looked at; freeimage
+    // deleted some icons uploaded through the shared API key
+    bool ok = upload_icon(ctrl->icon, len, true, url, sizeof(url), err, sizeof(err));
+    const char *host = "catbox";
     if (!ok) {
         char err2[128];
-        ok = upload_icon(ctrl->icon, len, true, url, sizeof(url), err2, sizeof(err2));
-        host = "catbox";
-        if (!ok) { strncat(err, " / catbox: ", sizeof(err) - strlen(err) - 1);
+        ok = upload_icon(ctrl->icon, len, false, url, sizeof(url), err2, sizeof(err2));
+        host = "freeimage";
+        if (!ok) { strncat(err, " / freeimage: ", sizeof(err) - strlen(err) - 1);
                    strncat(err, err2, sizeof(err) - strlen(err) - 1); }
     }
     if (ok) {
@@ -963,23 +990,35 @@ static void prepare_one(IconJob *j, u64 app_id, NsApplicationControlData *ctrl,
     }
 }
 
-// Goes through every installed title. Titles done before (any cache, or
-// known to have no icon) are skipped without touching the network, so a
-// second run only handles what was installed since.
-static void prepare_icons(IconJob *j, PadState *pad) {
+// Goes through every installed title.
+//  - new titles only: titles done before are skipped, except that saved links
+//    to uploaded / tinfoil icons are checked and redone when they stopped
+//    working (image hosts do delete files). Titles known to have no icon of
+//    their own are skipped too.
+//  - from scratch: every saved answer is forgotten and every title redone.
+static void prepare_icons(IconJob *j, PadState *pad, bool from_scratch) {
     memset(j, 0, sizeof(*j));
     if (R_FAILED(nsInitialize())) {
         job_line(j, "\x1b[31m", "Can't open the title list (ns).");
         return;
     }
-    json_object *eshop = cache_load(ESHOP_CACHE), *uploads = cache_load(UPLOAD_CACHE);
-    json_object *checked = cache_load(CHECKED_CACHE);
+    json_object *eshop, *uploads, *checked;
+    if (from_scratch) {
+        eshop = json_object_new_object();
+        uploads = json_object_new_object();
+        checked = json_object_new_object();
+    } else {
+        eshop = cache_load(ESHOP_CACHE);
+        uploads = cache_load(UPLOAD_CACHE);
+        checked = cache_load(CHECKED_CACHE);
+    }
     NsApplicationControlData *ctrl = malloc(sizeof(*ctrl));
 
     static NsApplicationRecord recs[64];
     s32 offset = 0, count = 0;
     bool stop = false;
-    job_line(j, "", "Checking installed titles...");
+    job_line(j, "", from_scratch ? "Preparing every installed title again..." :
+                                   "Checking installed titles and saved icon links...");
     while (ctrl && !stop && R_SUCCEEDED(nsListApplicationRecord(recs, 64, offset, &count)) && count > 0) {
         for (s32 i = 0; i < count && !stop; i++) {
             padUpdate(pad);
@@ -989,12 +1028,25 @@ static void prepare_icons(IconJob *j, PadState *pad) {
             char tid[17];
             snprintf(tid, sizeof(tid), "%016llx", (unsigned long long)recs[i].application_id);
             json_object *tmp;
-            if (json_object_object_get_ex(eshop, tid, &tmp) || json_object_object_get_ex(uploads, tid, &tmp) ||
-                json_object_object_get_ex(checked, tid, &tmp)) {
+            bool redo = false;
+            if (json_object_object_get_ex(uploads, tid, &tmp) ||
+                (json_object_object_get_ex(eshop, tid, &tmp) && strstr(json_object_get_string(tmp), "tinfoil"))) {
+                // a link we (or tinfoil) host: make sure it still works
+                if (j->done % 4 == 0) draw_icons(j, false);
+                if (link_alive(json_object_get_string(tmp)) == 0) {
+                    json_object_object_del(uploads, tid);
+                    json_object_object_del(eshop, tid);
+                    j->repaired++;
+                    redo = true;
+                }
+            }
+            if (!redo && (json_object_object_get_ex(eshop, tid, &tmp) || json_object_object_get_ex(uploads, tid, &tmp) ||
+                          json_object_object_get_ex(checked, tid, &tmp))) {
                 j->skipped++;
                 continue;
             }
             draw_icons(j, false);
+            if (redo) job_line(j, "\x1b[33m", "Saved icon link stopped working - redoing it:");
             prepare_one(j, recs[i].application_id, ctrl, eshop, uploads, checked);
             // save as we go, so stopping halfway keeps what's done
             json_object_to_file_ext(ESHOP_CACHE, eshop, JSON_C_TO_STRING_PLAIN);
@@ -1004,6 +1056,7 @@ static void prepare_icons(IconJob *j, PadState *pad) {
         }
         offset += count;
     }
+    // from scratch and stopped early: what wasn't reached yet is simply new next time
     free(ctrl);
     json_object_put(eshop);
     json_object_put(uploads);
@@ -1012,12 +1065,24 @@ static void prepare_icons(IconJob *j, PadState *pad) {
 
     int fresh = j->total - j->skipped;
     if (fresh == 0)
-        job_line(j, "\x1b[32m", "All %d titles already have their icons - nothing new to do.", j->total);
+        job_line(j, "\x1b[32m", "All %d titles have working icons - nothing to do.", j->total);
     else
-        job_line(j, "\x1b[1m", "Done: %d new (%d uploaded, %d found), %d already done before, %d to retry later.",
-                 fresh, j->uploaded, j->found, j->skipped, j->failed);
+        job_line(j, "\x1b[1m", "Done: %d prepared (%d uploaded, %d found, %d broken links redone), "
+                 "%d already fine, %d to retry later.",
+                 fresh, j->uploaded, j->found, j->repaired, j->skipped, j->failed);
     if (j->failed == 0 && fresh > 0)
         job_line(j, "", "The module uses these right away (no reboot needed).");
+}
+
+// the question before preparing: only what's new, or everything again
+static void draw_icons_ask(void) {
+    char a[200], b[200];
+    snprintf(a, sizeof(a), "\x1b[1m%s\x1b[0m", tr(T_IconsAskNew));
+    snprintf(b, sizeof(b), "\x1b[1m%s\x1b[0m", tr(T_IconsAskScratch));
+    const char *lines[] = { a, tr(T_IconsAskNewDesc), "", b, tr(T_IconsAskScratchDesc) };
+    ui_frame_begin();
+    ui_lines(tr(T_Icons), lines, 5, tr(T_FooterIconsAsk));
+    ui_frame_end();
 }
 
 // ---- update ---------------------------------------------------------------------
@@ -1168,8 +1233,7 @@ int main(int argc, char **argv) {
                     screen = Screen_Test;
                     run_test(&test);
                 } else if (sel == Item_Icons) {
-                    screen = Screen_Icons;
-                    prepare_icons(&icon_job, &pad);
+                    screen = Screen_IconsAsk;
                 } else if (sel == Item_Diag) {
                     screen = Screen_Diag;
                 } else if (sel == Item_Update) {
@@ -1182,6 +1246,14 @@ int main(int argc, char **argv) {
         } else if (screen == Screen_Diag) {
             if (down & (HidNpadButton_B | HidNpadButton_Plus)) { screen = Screen_Main; frame = 0; }
             if (down & HidNpadButton_Y) { start_module(&d); frame = 0; }
+        } else if (screen == Screen_IconsAsk) {
+            if (down & (HidNpadButton_A | HidNpadButton_Y)) {
+                screen = Screen_Icons;
+                prepare_icons(&icon_job, &pad, (down & HidNpadButton_Y) != 0);
+            } else if (down & (HidNpadButton_B | HidNpadButton_Plus)) {
+                screen = Screen_Main;
+                frame = 0;
+            }
         } else if (screen == Screen_Icons || screen == Screen_Update) {
             if (down & (HidNpadButton_B | HidNpadButton_Plus)) { screen = Screen_Main; frame = 0; }
         } else if (screen == Screen_Test) {
@@ -1250,6 +1322,7 @@ int main(int argc, char **argv) {
             break;
         }
         case Screen_Test:  draw_test(&test, true); break;
+        case Screen_IconsAsk: draw_icons_ask(); break;
         case Screen_Icons: draw_icons(&icon_job, true); break;
         case Screen_Update: draw_update(&update_job, true); break;
         case Screen_Login: draw_login(&lg, NULL); break;

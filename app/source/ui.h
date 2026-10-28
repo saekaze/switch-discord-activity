@@ -52,6 +52,7 @@ typedef enum {
     T_FooterMenu, T_FooterBack, T_FooterDiag, T_FooterWorking,
     T_LoginTitle, T_LoginStep1, T_LoginStep1b, T_LoginOr, T_LoginStep2, T_LoginStep3, T_FooterLogin,
     T_TestTitle, T_IconsTitle, T_DiagTitle,
+    T_IconsAskNew, T_IconsAskNewDesc, T_IconsAskScratch, T_IconsAskScratchDesc, T_FooterIconsAsk,
     T_NotShowing,
     T_MsgSaved, T_MsgOn, T_MsgOff, T_MsgLoggedOut, T_MsgNoWifi, T_MsgLoginOk, T_MsgLoginFail, T_MsgFinishing,
     T_Count

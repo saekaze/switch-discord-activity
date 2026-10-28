@@ -337,6 +337,7 @@ bool authenticatedRequest(const char* url, const char* method, struct curl_slist
     refreshAuthTokenIfNeeded();
     
     if (authToken.empty()) {
+        g_lastHttpCode = 0;  // nothing was sent - don't leave the refresh's answer here
         writeToLog("[Discord] WARNING: Attempted authenticated request but authToken is empty!");
         if (refreshToken.empty())
             g_lastError = "Not logged in - open Switch Discord Activity and log in";
@@ -346,6 +347,25 @@ bool authenticatedRequest(const char* url, const char* method, struct curl_slist
     std::string authHeader = "Authorization: Bearer " + authToken;
     struct curl_slist* authHeaders = curl_slist_append(headers, authHeader.c_str());
     return sendRequest(url, method, authHeaders, body, response);
+}
+
+// Deletes one session. True when it's gone: deleted, or Discord doesn't know
+// it anymore. A rejected login (401) is NOT "gone" - that used to drop
+// sessions that were still showing, so they stayed on Discord for good.
+static bool deleteSessionToken(const std::string& token) {
+    json_object* json_body = json_object_new_object();
+    json_object_object_add(json_body, "token", json_object_new_string(token.c_str()));
+    const char* body = json_object_get_string(json_body);
+    bool ok = false;
+    for (int attempt = 0; attempt < 2 && !ok; attempt++) {
+        struct curl_slist* headers = curl_slist_append(NULL, "Content-Type: application/json; charset=utf-8");
+        ok = authenticatedRequest("https://gaming-sdk.com/api/v9/users/@me/headless-sessions/delete", "POST", headers, body, NULL);
+        if (ok || g_lastHttpCode != 401) break;
+        writeToLog("[Discord] Delete got 401, refreshing the login and trying again.");
+        authTokenExpiry = 0;  // forces a refresh
+    }
+    json_object_put(json_body);
+    return ok || g_lastHttpCode == 404 || g_lastHttpCode == 400;
 }
 
 void discordCleanupStaleSessions() {
@@ -377,31 +397,29 @@ void discordCleanupStaleSessions() {
     }
     
     std::set<std::string> failed;  // kept for the next cleanup
+    bool currentGone = false;
     for (const std::string& token : uniqueTokens) {
-        json_object* json_body = json_object_new_object();
-        json_object_object_add(json_body, "token", json_object_new_string(token.c_str()));
-        const char* body = json_object_get_string(json_body);
-
-        struct curl_slist* headers = NULL;
-        headers = curl_slist_append(headers, "Content-Type: application/json; charset=utf-8");
-
         writeToLog("[Discord] Deleting stale headless session...");
-        bool ok = authenticatedRequest("https://gaming-sdk.com/api/v9/users/@me/headless-sessions/delete", "POST", headers, body, NULL);
-        // 4xx = Discord doesn't know it (already gone): nothing left to delete
-        if (!ok && (g_lastHttpCode == 0 || g_lastHttpCode >= 500))
+        // keep it unless it's really gone (offline, login refused, Discord down...)
+        bool gone = deleteSessionToken(token);
+        if (!gone && failed.size() < 50)
             failed.insert(token);
-
-        json_object_put(json_body);
+        if (gone && token == sessionToken)
+            currentGone = true;
     }
 
+    // rewrite the list: what couldn't be deleted, plus the session that's live
+    // right now - it used to be dropped here, so if deleting it failed later
+    // (offline at sleep / shutdown / logout) nothing remembered it and the
+    // status stayed on Discord
     remove("sdmc:/config/switchrpc_sessions");
+    if (!sessionToken.empty() && !currentGone)
+        failed.insert(sessionToken);
     if (!failed.empty()) {
         std::ofstream out("sdmc:/config/switchrpc_sessions", std::ios::trunc);
         for (const std::string& t : failed) out << t << std::endl;
-        writeToLog("[Discord] %d stale session(s) couldn't be deleted, will retry.", (int)failed.size());
-    } else {
-        writeToLog("[Discord] Stale sessions cleaned up.");
     }
+    writeToLog("[Discord] Stale sessions cleaned up (%d kept for later).", (int)failed.size());
 }
 
 // Buttons in headless sessions aren't documented: try the RPC shape first,
@@ -567,14 +585,6 @@ bool discordCreateHeadlessSession(u64 titleId, std::string titleName, u64 startR
     return true;
 }
 
-static void deleteSessionToken(const std::string& token) {
-    json_object* json_body = json_object_new_object();
-    json_object_object_add(json_body, "token", json_object_new_string(token.c_str()));
-    const char* body = json_object_get_string(json_body);
-    struct curl_slist* headers = curl_slist_append(NULL, "Content-Type: application/json; charset=utf-8");
-    authenticatedRequest("https://gaming-sdk.com/api/v9/users/@me/headless-sessions/delete", "POST", headers, body, NULL);
-    json_object_put(json_body);
-}
 
 // Drop the old session first and give Discord a moment, then create the new
 // one. If the activity never disappears, Discord treats the new session as
@@ -610,21 +620,12 @@ void discordDeleteHeadlessSession() {
         return; 
     }
 
-    json_object* json_body = json_object_new_object();
-    json_object_object_add(json_body, "token", json_object_new_string(sessionToken.c_str()));
-    const char* body = json_object_get_string(json_body);
-
-    struct curl_slist* headers = NULL;
-    headers = curl_slist_append(headers, "Content-Type: application/json; charset=utf-8");
-
-    authenticatedRequest("https://gaming-sdk.com/api/v9/users/@me/headless-sessions/delete", "POST", headers, body, NULL);
-
-    json_object_put(json_body);
-    
-    // Clear the token so we don't try to use it again
+    // the token stays in switchrpc_sessions until a cleanup confirms it's gone,
+    // so a failed delete here is retried later
+    bool gone = deleteSessionToken(sessionToken);
     sessionToken = "";
     sessionTokenExpiry = 0;
-    writeToLog("[Discord] Session deleted successfully.");
+    writeToLog(gone ? "[Discord] Session deleted." : "[Discord] Couldn't delete the session now, will retry.");
 }
 
 void discordLogout() {

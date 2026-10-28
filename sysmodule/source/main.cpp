@@ -440,6 +440,8 @@ int main(int argc, char* argv[])
             cur = Want();
             pending = Want();
         }
+        if (!wasLoggedIn && loggedIn)
+            needCleanup = true;  // just logged in: drop what the old login couldn't
         wasLoggedIn = loggedIn;
         if (!loggedIn)
             writeStatus("login", "Not logged in - open Switch Discord Activity and log in");

@@ -63,7 +63,7 @@ That's it. Start a game, and it shows up on Discord within a few seconds. You do
 
 The app also has:
 - **Test connection** — sends a test status and shows Discord's answer for each step;
-- **Prepare icons** — uploads all forwarder icons at once, as a backup. Running it again only handles titles installed since;
+- **Prepare icons** — uploads all forwarder icons at once, as a backup. It asks first: *new titles only* (titles installed since last time, plus icons whose link stopped working) or *from scratch* (everything again);
 - **Diagnostics & log** — versions, module state, the log;
 - **Check for updates** — installs the newest release.
 
@@ -114,7 +114,7 @@ All of these are set in [`include/config.h`](include/config.h). A fork with its 
 
 - **Login.** It goes through Discord's own authorization page. llsc12's static page only passes the one-time code from your phone back to the console. The token's scope is **presence only** (`sdk.social_layer_presence`): no messages, no servers.
 - **Token on the SD card.** The refresh token is stored in `sdmc:/config/switchrpc_token`. Anyone with your SD card can set your Discord status (nothing more). *Log out* in the app deletes it.
-- **Uploaded icons are public.** Forwarder icons are uploaded to freeimage.host (or catbox.moe as a fallback), because Discord only shows images by URL. Only the icon image is sent.
+- **Uploaded icons are public.** Forwarder icons are uploaded to catbox.moe (or freeimage.host as a fallback), because Discord only shows images by URL. Only the icon image is sent. Hosts can delete files, so saved links are checked and a dead one is uploaded again.
 - **No certificate checks.** Like the original, the console doesn't verify TLS certificates for these requests: its certificate store can't verify these hosts.
 - **Update check.** When the app opens, it asks `api.github.com` for the latest release (nothing about you is sent). Downloaded updates are checked against the release's `SHA256SUMS`, which catches broken downloads; since certificates aren't verified, it doesn't protect against someone who controls your network.
 

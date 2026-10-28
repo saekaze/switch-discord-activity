@@ -39,7 +39,20 @@ static bool loadIconFromCache(const char* titleId, std::string& out_url, const c
     return found;
 }
 
-static void saveIconToCache(const char* titleId, const char* url, const char* path = ICON_CACHE_PATH) {
+static void saveIconToCache(const char* titleId, const char* url, const char* path = ICON_CACHE_PATH);
+
+// forget a saved link (it stopped working)
+static void removeIconFromCache(const char* titleId, const char* path) {
+    json_object* root = json_object_from_file(path);
+    if (!root) return;
+    if (json_object_object_get_ex(root, titleId, NULL)) {
+        json_object_object_del(root, titleId);
+        json_object_to_file_ext(path, root, JSON_C_TO_STRING_PLAIN);
+    }
+    json_object_put(root);
+}
+
+static void saveIconToCache(const char* titleId, const char* url, const char* path) {
     std::ifstream infile(path);
     std::string contents;
     if (infile.is_open()) {
@@ -245,6 +258,38 @@ static int eshopSearch(u64 titleId, std::string& out_url) {
     return found ? 1 : 0;
 }
 
+// Is a saved icon link still there? 1 = yes, 0 = gone (404/410), -1 = can't
+// tell (offline, host down). Downloads the first bytes: catbox answers a HEAD
+// request with 200 even for files that don't exist.
+static int linkAlive(const char* url) {
+    CURL* curl = curl_easy_init();
+    if (!curl) return -1;
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_RANGE, "0-1023");
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, +[](char*, size_t size, size_t nmemb, void*) -> size_t {
+        return size * nmemb;
+    });
+    struct curl_slist* headers = curl_slist_append(NULL, "User-Agent: SwitchRPC/1.0");
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    int r = -1;
+    if (curl_easy_perform(curl) == CURLE_OK) {
+        long code = 0;
+        char* type = NULL;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+        curl_easy_getinfo(curl, CURLINFO_CONTENT_TYPE, &type);
+        if ((code == 200 || code == 206) && type && strncmp(type, "image/", 6) == 0) r = 1;
+        else if (code == 404 || code == 410) r = 0;
+    }
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    return r;
+}
+
 // HEAD-style check that a URL answers 200 with an image
 static bool urlIsImage(const char* url) {
     CURL* curl = curl_easy_init();
@@ -275,9 +320,10 @@ static bool urlIsImage(const char* url) {
 // --- forwarders: upload the title's own icon so Discord can show it ---------
 //
 // Discord only takes an image *URL*. A forwarder's icon only exists on the
-// console (in its control data), so it gets uploaded once to freeimage.host
-// (public API key from freeimage.host/page/api) and the link is cached on the
-// SD card - every later launch of that title reuses it.
+// console (in its control data), so it gets uploaded once to catbox.moe
+// (freeimage.host as a fallback, public API key from freeimage.host/page/api)
+// and the link is cached on the SD card - every later launch of that title
+// reuses it. Hosts can delete files, so a saved link is checked once per boot.
 
 #define FREEIMAGE_KEY "6d207e02198a847aa98d0a2a901485a5"
 
@@ -393,7 +439,9 @@ static bool uploadOwnIcon(u64 titleId, std::string& out_url) {
         return false;
     }
     IconReader reader = { ctrl->icon, (size_t)(actual - sizeof(ctrl->nacp)), 0 };
-    bool ok = uploadTo(false, reader, out_url) || uploadTo(true, reader, out_url);
+    // catbox first: it keeps files as long as they're looked at; freeimage
+    // deleted some icons uploaded through the shared API key
+    bool ok = uploadTo(true, reader, out_url) || uploadTo(false, reader, out_url);
     free(ctrl);
 
     if (ok) {
@@ -404,26 +452,42 @@ static bool uploadOwnIcon(u64 titleId, std::string& out_url) {
 }
 
 IconKind resolveIconUrl(u64 titleId, std::string& out_url, bool cacheOnly) {
-    // remember the last answer: the session is re-posted every 15 minutes
-    static u64 lastTid = 0;
-    static std::string lastUrl;
-    static IconKind lastKind = Icon_Miss;
-    if (titleId == lastTid && lastKind != Icon_Miss) {
-        out_url = lastUrl;
-        return lastKind;
-    }
+    // a title with no icon anywhere: don't look it up again on every re-post
+    static u64 noIconTid = 0;
+    // saved links already checked this boot (a check is a download)
+    static std::set<u64> checkedLinks;
 
     char titleIdStr[17];
     snprintf(titleIdStr, sizeof(titleIdStr), "%016llx", (unsigned long long)titleId);
+
+    // a link we (or tinfoil) host can disappear: check it once per boot and
+    // redo it if it's gone. eShop images live on Nintendo's own servers.
+    auto stillWorks = [&](const std::string& url, const char* path, bool ours) -> bool {
+        if (checkedLinks.count(titleId)) return true;
+        if (!ours && url.find("tinfoil") == std::string::npos) return true;
+        int r = linkAlive(url.c_str());
+        if (r == 0) {
+            writeToLog("[Icon] Saved icon for %s is gone (%s), redoing it", titleIdStr, url.c_str());
+            removeIconFromCache(titleIdStr, path);
+            return false;
+        }
+        if (r > 0) checkedLinks.insert(titleId);  // can't tell (offline): use it, check again later
+        return true;
+    };
 
     IconKind kind = Icon_Miss;
     out_url.clear();
     if (titleId == HOMEBREW_TID) {
         out_url = NRO_ICON_URL;
-        kind = Icon_Homebrew;
-    } else if (loadIconFromCache(titleIdStr, out_url)) {
+        return Icon_Homebrew;
+    }
+    if (titleId == noIconTid) {
+        out_url = NRO_ICON_URL;
+        return Icon_Homebrew;
+    }
+    if (loadIconFromCache(titleIdStr, out_url) && stillWorks(out_url, ICON_CACHE_PATH, false)) {
         kind = Icon_Official;
-    } else if (loadIconFromCache(titleIdStr, out_url, UPLOAD_CACHE_PATH)) {
+    } else if (loadIconFromCache(titleIdStr, out_url, UPLOAD_CACHE_PATH) && stillWorks(out_url, UPLOAD_CACHE_PATH, true)) {
         kind = Icon_Homebrew;
     } else if (cacheOnly) {
         return Icon_Miss;  // caller shows the status now and comes back for the icon
@@ -444,13 +508,11 @@ IconKind resolveIconUrl(u64 titleId, std::string& out_url, bool cacheOnly) {
             // nothing usable at all -> generic homebrew icon
             out_url = NRO_ICON_URL;
             kind = Icon_Homebrew;
+            noIconTid = titleId;
             writeToLog("[Icon] Unknown title %016llX, using the homebrew icon", (unsigned long long)titleId);
         }
     }
-
-    lastTid = titleId;
-    lastUrl = out_url;
-    lastKind = kind;
+    if (kind != Icon_Miss) checkedLinks.insert(titleId);  // fresh lookup: no need to check it again
     return kind;
 }
 

@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.1.5] - 2026-10-28
+
+### Fixed
+- **Broken icons** (a link that shows a 404): freeimage.host deleted some uploaded icons, and the saved link was used forever. Saved icon links are now checked once per boot by the module (and by *Prepare icons*), and a dead one is uploaded again automatically. Icons now go to catbox.moe first, which keeps files as long as they're being looked at; freeimage.host is the fallback.
+- **A status that stayed on Discord** while the console was offline: the module could lose track of a session that was still showing - its cleanup dropped the live session from its list, and a delete refused because of the login (HTTP 401) counted as done. Those sessions are now kept until Discord confirms they're gone (the login is refreshed and the delete retried), and logging in again also clears what the old login left behind.
+
+### New
+- **Prepare icons** asks first: *new titles only* (also redoes icons whose link stopped working) or *from scratch* (forgets every saved icon and prepares everything again).
+
 ## [1.1.4] - 2026-10-28
 
 > **Coming from 1.1.0 - 1.1.3? Restart the console after "Check for updates".** Those versions can't replace the app while it's open; the new background module finishes the update at the next boot. Steps below.
