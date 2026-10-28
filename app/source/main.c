@@ -1111,6 +1111,8 @@ int main(int argc, char **argv) {
     // Menu doesn't list it twice
     if (!(argc > 0 && argv[0] && strstr(argv[0], "switch-rpc.nro")) && access(OLD_NRO, F_OK) == 0)
         remove(OLD_NRO);
+    // store-page cache from 1.1.1 and older (replaced by -v2)
+    remove("sdmc:/config/switchrpc-eshop-pages.json");
 
     Diag d = {0};
     diag_versions(&d);

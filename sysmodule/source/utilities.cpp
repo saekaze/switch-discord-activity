@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <string>
+#include <set>
 #include <fstream>
 #include <switch.h>
 #include <json-c/json.h>
@@ -13,7 +14,9 @@
 // links to forwarder/homebrew icons we uploaded ourselves (not in the eShop)
 #define UPLOAD_CACHE_PATH "sdmc:/config/switchrpc-uploaded-icons.json"
 // eShop store pages ("" = the eShop doesn't list it)
-#define PAGE_CACHE_PATH "sdmc:/config/switchrpc-eshop-pages.json"
+// v2: 1.1.1 and older cached "no page" when the eShop search was merely
+// blocked, so those answers aren't trusted
+#define PAGE_CACHE_PATH "sdmc:/config/switchrpc-eshop-pages-v2.json"
 
 static bool loadIconFromCache(const char* titleId, std::string& out_url, const char* path = ICON_CACHE_PATH) {
     std::ifstream file(path);
@@ -61,7 +64,9 @@ static void saveIconToCache(const char* titleId, const char* url, const char* pa
     json_object_put(root);
 }
 
-static bool eshopSearch(u64 titleId, std::string& out_url);
+// 1 = found, 0 = the eShop doesn't list it, -1 = couldn't ask (blocked / offline)
+static int eshopSearch(u64 titleId, std::string& out_url);
+static int ecLinkStatus(const char* url);
 
 bool fetchEshopIconUrl(u64 titleId, std::string& out_url) {
     char titleIdStr[17] = {0};
@@ -71,7 +76,7 @@ bool fetchEshopIconUrl(u64 titleId, std::string& out_url) {
         writeToLog("[eShop] Cache hit for %s: %s", titleIdStr, out_url.c_str());
         return true;
     }
-    return eshopSearch(titleId, out_url);
+    return eshopSearch(titleId, out_url) > 0;
 }
 
 int getEshopPage(u64 titleId, std::string& out_url, bool cacheOnly) {
@@ -81,16 +86,60 @@ int getEshopPage(u64 titleId, std::string& out_url, bool cacheOnly) {
         return out_url.empty() ? 0 : 1;
     if (cacheOnly)
         return -1;
+    // looked up once per boot when it couldn't be decided, so a blocked
+    // network doesn't cost two timeouts on every status change
+    static std::set<u64> undecided;
+    if (undecided.count(titleId)) {
+        out_url.clear();
+        return 0;
+    }
     std::string icon;
-    eshopSearch(titleId, icon);  // stores the page if there is one
+    int r = eshopSearch(titleId, icon);  // stores the page if there is one
     if (loadIconFromCache(titleIdStr, out_url, PAGE_CACHE_PATH) && !out_url.empty())
         return 1;
+    if (r < 0) {
+        // the search is blocked in some countries / networks: Nintendo's
+        // short store link works too, and tells listed titles apart (30x vs 404)
+        char ec[80];
+        snprintf(ec, sizeof(ec), "https://ec.nintendo.com/apps/%016llX/GB", (unsigned long long)titleId);
+        int e = ecLinkStatus(ec);
+        if (e > 0) {
+            saveIconToCache(titleIdStr, ec, PAGE_CACHE_PATH);
+            out_url = ec;
+            writeToLog("[eShop] Search unreachable, using the store link %s", ec);
+            return 1;
+        }
+        if (e < 0) {
+            undecided.insert(titleId);  // don't cache "no page" for what we couldn't check
+            writeToLog("[eShop] Can't reach the eShop for %s, no button this time", titleIdStr);
+            out_url.clear();
+            return 0;
+        }
+    }
     saveIconToCache(titleIdStr, "", PAGE_CACHE_PATH);  // remember "no page"
     out_url.clear();
     return 0;
 }
 
-static bool eshopSearch(u64 titleId, std::string& out_url) {
+static int ecLinkStatus(const char* url) {
+    CURL* curl = curl_easy_init();
+    if (!curl) return -1;
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+    CURLcode res = curl_easy_perform(curl);
+    long code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+    curl_easy_cleanup(curl);
+    if (res != CURLE_OK) return -1;
+    if (code >= 300 && code < 400) return 1;
+    if (code == 404 || code == 410) return 0;
+    return -1;
+}
+
+static int eshopSearch(u64 titleId, std::string& out_url) {
     char titleIdStr[17] = {0};
     snprintf(titleIdStr, sizeof(titleIdStr), "%016llx", (unsigned long long)titleId);
 
@@ -107,7 +156,7 @@ static bool eshopSearch(u64 titleId, std::string& out_url) {
     CURL* curl = curl_easy_init();
     if (!curl) {
         writeToLog("[eShop] Failed to init cURL for icon lookup");
-        return false;
+        return -1;
     }
 
     std::string response;
@@ -134,19 +183,25 @@ static bool eshopSearch(u64 titleId, std::string& out_url) {
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 
     CURLcode res = curl_easy_perform(curl);
+    long code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
     curl_slist_free_all(headers);
     curl_slist_free_all(dns_cache);
     curl_easy_cleanup(curl);
 
     if (res != CURLE_OK) {
         writeToLog("[eShop] cURL failed: %s", curl_easy_strerror(res));
-        return false;
+        return -1;
+    }
+    if (code != 200) {
+        writeToLog("[eShop] Search answered HTTP %ld", code);
+        return -1;
     }
 
     json_object* root = json_tokener_parse(response.c_str());
     if (!root) {
         writeToLog("[eShop] Failed to parse JSON response");
-        return false;
+        return -1;
     }
 
     bool found = false;
@@ -187,7 +242,7 @@ static bool eshopSearch(u64 titleId, std::string& out_url) {
         writeToLog("[eShop] No icon found in EU eShop for %s", titleIdStr);
     }
 
-    return found;
+    return found ? 1 : 0;
 }
 
 // HEAD-style check that a URL answers 200 with an image

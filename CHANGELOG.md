@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.2] - 2026-10-28
+
+### Fixed
+- **The eShop button never appeared** where Nintendo's eShop search is blocked: a failed lookup was saved as "this game has no store page". The module now falls back to Nintendo's short store link (`ec.nintendo.com/apps/<id>/GB`), which also tells listed games apart. Store pages are looked up again once, since the old answers can't be trusted.
+- Note: Discord may not show the buttons of your **own** status to you, and you can't click them yourself. Check from another account.
+
 ## [1.1.1] - 2026-10-28
 
 ### Fixed
