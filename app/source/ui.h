@@ -5,6 +5,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include "settings.h"
 
@@ -72,5 +73,10 @@ void ui_menu(const MenuModel *m);
 void ui_lines(const char *title, const char *const *lines, int n, const char *footer);
 // QR login page. qr = size*size bytes, nonzero = dark module.
 void ui_login(const char *url, const uint8_t *qr, int qr_size, const char *note);
+// Text pages show about TEXT_COLS columns. Returns how many bytes of s fit in
+// `cols` columns (CJK counts two) without splitting a UTF-8 character; with
+// at_space, a cut prefers the last space.
+#define TEXT_COLS 74
+size_t ui_text_fit(const char *s, int cols, bool at_space);
 // Saves the current frame as a BMP (PC previews).
 void ui_screenshot(const char *path);

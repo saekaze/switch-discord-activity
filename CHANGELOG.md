@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.1] - 2026-10-28
+
+### Fixed
+- **Prepare icons** stopped at "couldn't reach the eShop" and never made an icon on networks that block Nintendo's eShop search. It now goes on to tinfoil and the title's own icon, like 1.0.0 did.
+- Long lines in the app were cut off instead of wrapped, and a Japanese (or other non-English) name could be cut in the middle of a character. They now wrap, and names are shortened cleanly.
+
 ## [1.1.0] - 2026-10-27
 
 ### New

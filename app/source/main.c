@@ -375,7 +375,7 @@ typedef struct {
     char icon[200];        // image URL the module sent to Discord
     long long clock_off;   // real time minus console clock, seconds
     bool have_clock;
-    char log[20][80];
+    char log[20][200];
     int log_lines;
 } Diag;
 
@@ -415,7 +415,7 @@ static void read_log(Diag *d) {
         const char *msg = strchr(line, ']') ? strchr(line, ']') + 2 : line;
         if (strstr(line, "Status is live")) {
             d->status_color = "\x1b[32m";
-            snprintf(d->status, sizeof(d->status), "%.190s", msg);
+            snprintf(d->status, sizeof(d->status), "%.*s", (int)ui_text_fit(msg, 90, false), msg);
         } else if (strstr(line, "Clearing") || strstr(line, "Sleep imminent")) {
             d->status_color = "";
             snprintf(d->status, sizeof(d->status), "No game running - status cleared. Start a game, wait ~10 s.");
@@ -424,7 +424,7 @@ static void read_log(Diag *d) {
             snprintf(d->status, sizeof(d->status), "Not logged in - press A.");
         } else if (strstr(line, "HTTP 4") || strstr(line, "Failed") || strstr(line, "failed")) {
             d->status_color = "\x1b[31m";
-            snprintf(d->status, sizeof(d->status), "%.190s", msg);
+            snprintf(d->status, sizeof(d->status), "%.*s", (int)ui_text_fit(msg, 90, false), msg);
         } else if (strstr(line, "Sysmodule started")) {
             d->status_color = "";
             snprintf(d->status, sizeof(d->status), "Module started. Start a game and wait ~10 s.");
@@ -433,12 +433,16 @@ static void read_log(Diag *d) {
         if (!interesting(line))
             continue;
         // wrap instead of cutting: the reason for an error is at the end
-        for (size_t off = 0, len = strlen(line); off < len; off += 74) {
+        for (const char *p = line; *p;) {
             if (d->log_lines == 20) {
                 memmove(d->log[0], d->log[1], sizeof(d->log[0]) * 19);
                 d->log_lines = 19;
             }
-            snprintf(d->log[d->log_lines++], sizeof(d->log[0]), "%s%.74s", off ? "  " : "", line + off);
+            bool first = p == line;
+            size_t n = ui_text_fit(p, first ? TEXT_COLS : TEXT_COLS - 2, true);
+            snprintf(d->log[d->log_lines++], sizeof(d->log[0]), "%s%.*s", first ? "" : "  ", (int)n, p);
+            p += n;
+            while (*p == ' ') p++;
         }
     }
     fclose(f);
@@ -550,7 +554,7 @@ static int diag_lines(const Diag *d, const char **out) {
     L("%s Logged in to Discord%s%s", d->logged_in ? mark(true) : "\x1b[33m[ -- ]\x1b[0m",
       d->logged_in ? " as " : "", d->logged_in ? (d->user[0] ? d->user : "you") : "");
     L("%s Internet", mark(d->online));
-    L("Now: %s%.68s\x1b[0m", d->status_color ? d->status_color : "", d->status);
+    L("Now: %s%.*s\x1b[0m", d->status_color ? d->status_color : "", (int)ui_text_fit(d->status, TEXT_COLS - 5, false), d->status);
     if (d->icon[0]) L("Icon: %.70s", d->icon);
     if (d->have_clock && (d->clock_off > 60 || d->clock_off < -60))
         L("\x1b[33mConsole clock is %lld min %s - the module corrects for it.\x1b[0m",
@@ -587,7 +591,7 @@ static Lang console_lang(void) {
 #define SUPER_PROPS "X-Super-Properties: eyJicm93c2VyIjoiRGlzY29yZCBFbWJlZGRlZCIsImJyb3dzZXJfdXNlcl9hZ2VudCI6IkRpc2NvcmQgRW1iZWRkZWQvMC4wLjgiLCJicm93c2VyX3ZlcnNpb24iOiIwLjAuOCIsImNsaWVudF9idWlsZF9udW1iZXIiOjMwNDY4MywiZGVzaWduX2lkIjowLCJvcyI6IlVua25vd24iLCJyZWxlYXNlX2NoYW5uZWwiOiJ1bmtub3duIn0K"
 
 typedef struct {
-    char lines[24][96];
+    char lines[24][200];
     int n;
     char session[512];   // test session token, deleted when leaving the screen
     char access[512];
@@ -599,12 +603,14 @@ static void test_line(Test *t, const char *color, const char *fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    // wrap at 74 columns
-    for (size_t off = 0, len = strlen(buf); off < len || off == 0; off += 74) {
+    const char *p = buf;
+    do {
         if (t->n == 24) return;
-        snprintf(t->lines[t->n++], sizeof(t->lines[0]), "%s%.74s\x1b[0m", color, buf + off);
-        if (len == 0) break;
-    }
+        size_t n = ui_text_fit(p, TEXT_COLS, true);
+        snprintf(t->lines[t->n++], sizeof(t->lines[0]), "%s%.*s\x1b[0m", color, (int)n, p);
+        p += n;
+        while (*p == ' ') p++;
+    } while (*p);
 }
 
 static void draw_test(const Test *t, bool done) {
@@ -749,7 +755,7 @@ static void end_test(Test *t) {
 #define CHECKED_CACHE "sdmc:/config/switchrpc-icons-checked.json"
 
 typedef struct {
-    char lines[24][96];
+    char lines[24][200];
     int n;
     int done, total, uploaded, failed, skipped, found;
 } IconJob;
@@ -760,8 +766,14 @@ static void job_line(IconJob *j, const char *color, const char *fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    if (j->n == 24) { memmove(j->lines[0], j->lines[1], sizeof(j->lines[0]) * 23); j->n = 23; }
-    snprintf(j->lines[j->n++], sizeof(j->lines[0]), "%s%.74s\x1b[0m", color, buf);
+    const char *p = buf;
+    do {
+        if (j->n == 24) { memmove(j->lines[0], j->lines[1], sizeof(j->lines[0]) * 23); j->n = 23; }
+        size_t n = ui_text_fit(p, TEXT_COLS, true);
+        snprintf(j->lines[j->n++], sizeof(j->lines[0]), "%s%.*s\x1b[0m", color, (int)n, p);
+        p += n;
+        while (*p == ' ') p++;
+    } while (*p);
 }
 
 static void draw_icons(const IconJob *j, bool finished) {
@@ -899,23 +911,19 @@ static void prepare_one(IconJob *j, u64 app_id, NsApplicationControlData *ctrl,
     char tid[17];
     snprintf(tid, sizeof(tid), "%016llx", (unsigned long long)app_id);
     u64 actual = 0;
-    char name[64] = "?";
+    char name[100] = "?";
     bool have_ctrl = R_SUCCEEDED(nsGetApplicationControlData(NsApplicationControlSource_Storage,
                                  app_id, ctrl, sizeof(*ctrl), &actual));
     if (have_ctrl) {
         NacpLanguageEntry *le = NULL;
         if (R_SUCCEEDED(nacpGetLanguageEntry(&ctrl->nacp, &le)) && le && le->name[0])
-            snprintf(name, sizeof(name), "%.40s", le->name);
+            snprintf(name, sizeof(name), "%.*s", (int)ui_text_fit(le->name, 30, false), le->name);
     }
 
     char url[300], err[128] = "";
+    // the eShop search can be unreachable (some countries/networks block
+    // it) - then tinfoil and the title's own icon still work
     int es = eshop_icon(tid, url, sizeof(url));
-    if (es < 0) {
-        // don't mistake a network hiccup for "not in the eShop"
-        j->failed++;
-        job_line(j, "\x1b[33m", "%s: couldn't reach the eShop - tried again next time", name);
-        return;
-    }
     if (es > 0) {
         json_object_object_add(eshop, tid, json_object_new_string(url));
         j->found++;

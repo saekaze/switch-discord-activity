@@ -214,6 +214,30 @@ static void reset_petal(Petal *p, bool anywhere) {
     p->spin = (rand() % 360);
 }
 
+// ---- text width ---------------------------------------------------------------
+
+// a CJK character takes two columns; a UTF-8 character is never split
+size_t ui_text_fit(const char *s, int cols, bool at_space) {
+    size_t i = 0, space = 0;
+    int used = 0;
+    while (s[i]) {
+        unsigned char c = s[i];
+        size_t n = c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : (c >> 3) == 30 ? 4 : 1;
+        for (size_t k = 1; k < n; k++)
+            if (((unsigned char)s[i + k] & 0xC0) != 0x80) { n = 1; break; }  // broken sequence
+        uint32_t cp = n == 3 ? ((c & 0x0F) << 12) | ((s[i + 1] & 0x3F) << 6) | (s[i + 2] & 0x3F) : c;
+        int w = n == 4 || (n == 3 && cp >= 0x1100) ? 2 : 1;
+        if (used + w > cols) {
+            if (at_space && space > i / 2) return space;
+            return i;
+        }
+        if (c == ' ') space = i;
+        used += w;
+        i += n;
+    }
+    return i;
+}
+
 bool ui_init(Lang lang) {
     g_lang = lang;
 #ifdef __SWITCH__
@@ -523,7 +547,7 @@ void ui_menu(const MenuModel *m) {
     if (!m->set[Set_Enabled] || !strcmp(st, "off")) { snprintf(now, sizeof(now), "%s", tr(T_TurnedOff)); nc = C_Dim; }
     else if (!strcmp(st, "live")) { snprintf(now, sizeof(now), tr(T_Live), m->status_text); nc = C_Good; }
     else if (!strcmp(st, "login")) { snprintf(now, sizeof(now), "%s", tr(T_NotLoggedIn)); nc = C_Warn; }
-    else { snprintf(now, sizeof(now), "%.70s", m->status_text ? m->status_text : ""); if (!strcmp(st, "error")) nc = C_Bad; }
+    else { const char *t = m->status_text ? m->status_text : ""; snprintf(now, sizeof(now), "%.*s", (int)ui_text_fit(t, 70, false), t); if (!strcmp(st, "error")) nc = C_Bad; }
     text(vx, y + 52, F_Body, nc, 0, now);
 
     // the master switch: a seal stamp
