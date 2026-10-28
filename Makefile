@@ -37,7 +37,8 @@ dist: all
 	@cd $(STAGE) && zip -qr ../$(notdir $(ZIP)) atmosphere switch
 	@cp sysmodule/SwitchRPC.nsp out/exefs.nsp
 	@cp app/switch-discord-activity.nro overlay/switch-discord-activity.ovl out/
-	@cd out && sha256sum exefs.nsp switch-discord-activity.nro switch-discord-activity.ovl $(notdir $(ZIP)) > SHA256SUMS
+	@# binary-mode lines ("hash *name"): the 1.1.0 updater only reads those
+	@cd out && sha256sum -b exefs.nsp switch-discord-activity.nro switch-discord-activity.ovl $(notdir $(ZIP)) > SHA256SUMS
 	@echo "built $(ZIP)"
 
 clean:

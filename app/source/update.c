@@ -225,7 +225,8 @@ static bool sum_for(const char *sums, const char *name, char out[65]) {
             memcpy(line, p, len);
             line[len] = '\0';
             char h[65], n[160];
-            if (sscanf(line, "%64s %*[ *]%159s", h, n) == 2 && !strcmp(n, name)) {
+            // "hash  name" (text mode) or "hash *name" (binary mode)
+            if (sscanf(line, "%64s %159s", h, n) == 2 && !strcmp(n[0] == '*' ? n + 1 : n, name)) {
                 snprintf(out, 65, "%s", h);
                 return true;
             }

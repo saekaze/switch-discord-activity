@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.1.3] - 2026-10-28
+
+### Fixed
+- **Check for updates** stopped with "No checksum for it in SHA256SUMS": the app couldn't read the usual `hash  name` lines. It now reads both forms, and releases list the files as `hash *name`, which 1.1.0 - 1.1.2 can read too, so they can update to this version from the app.
+
 ## [1.1.2] - 2026-10-28
 
 ### Fixed

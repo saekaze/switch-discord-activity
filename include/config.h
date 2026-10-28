@@ -1,7 +1,7 @@
 // Shared settings for the sysmodule and the app.
 #pragma once
 
-#define SWITCHRPC_VERSION "1.1.2"
+#define SWITCHRPC_VERSION "1.1.3"
 
 // Program id of the background module (atmosphere/contents/<id>/).
 // Same id as llsc12/SwitchRPC, so installing this replaces it instead of
