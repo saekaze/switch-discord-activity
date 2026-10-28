@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.1.7] - 2026-10-29
+
+### Fixed
+- **Games that are a second program inside another one** (Sonic Generations in SONIC X SHADOW GENERATIONS) showed their ID, the homebrew icon and "(homebrew)". They now show as the application they belong to, with its name, icon and eShop page.
+- **Official games labelled "(homebrew)"** (noticed with custom icons from IconSwap NX): when the eShop and tinfoil didn't answer - a busy server, a timeout - the game was taken for homebrew and its own icon uploaded. Now a title only counts as homebrew when tinfoil really doesn't know it; if a server doesn't answer, *Prepare icons* tries those titles again at the end, slower, and the module asks again later. Run *Prepare icons -> From scratch* once to fix icons that were already saved this way.
+- **Ports without an icon until Prepare icons ran a second time**: titles a server didn't answer for are now retried automatically in the same run, and at most 2 icons are uploaded at a time so the image hosts don't turn requests away.
+- **Icons appearing late on Discord**: checking a saved icon link no longer holds up the status - it's posted right away, and only re-posted if the link turned out to be dead.
+- **Logging out left the last status on Discord for good** (only removing the app's authorization in Discord cleared it). Logging out now also revokes the login, after deleting the statuses.
+
 ## [1.1.6] - 2026-10-28
 
 ### Changed

@@ -33,6 +33,7 @@ enum IconKind {
     Icon_Miss,      ///< cacheOnly lookup found nothing yet - out_url is empty
     Icon_Official,  ///< eShop / tinfoil game icon
     Icon_Homebrew,  ///< forwarder's own uploaded icon or the generic hbmenu icon
+    Icon_Unknown,   ///< the icon hosts didn't answer: no image for now, asked again later
 };
 
 /**
@@ -42,6 +43,11 @@ enum IconKind {
  * Icon_Miss if the answer isn't cached yet.
  */
 IconKind resolveIconUrl(u64 titleId, std::string& out_url, bool cacheOnly);
+
+/// set by a cacheOnly resolveIconUrl that used a saved link not checked yet
+/// this boot: the caller posts first, then checks it (resolveIconUrl again
+/// without cacheOnly) and re-posts only if the link was dead
+extern bool g_iconCheckLater;
 
 /**
  * eShop store page of a title. 1 = found, 0 = the eShop doesn't list it,

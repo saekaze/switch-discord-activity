@@ -290,33 +290,6 @@ static int linkAlive(const char* url) {
     return r;
 }
 
-// HEAD-style check that a URL answers 200 with an image
-static bool urlIsImage(const char* url) {
-    CURL* curl = curl_easy_init();
-    if (!curl) return false;
-    curl_easy_setopt(curl, CURLOPT_URL, url);
-    curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
-    struct curl_slist* headers = curl_slist_append(NULL, "User-Agent: SwitchRPC/1.0");
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-
-    bool ok = false;
-    if (curl_easy_perform(curl) == CURLE_OK) {
-        long code = 0;
-        char* type = NULL;
-        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
-        curl_easy_getinfo(curl, CURLINFO_CONTENT_TYPE, &type);
-        ok = code == 200 && type && strncmp(type, "image/", 6) == 0;
-    }
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-    return ok;
-}
-
 // --- forwarders: upload the title's own icon so Discord can show it ---------
 //
 // Discord only takes an image *URL*. A forwarder's icon only exists on the
@@ -451,9 +424,50 @@ static bool uploadOwnIcon(u64 titleId, std::string& out_url) {
     return ok;
 }
 
+bool g_iconCheckLater = false;
+
+// tinfoil.media has an icon for every official title: 1 = it has this one,
+// 0 = it doesn't (so it's homebrew / a forwarder), -1 = no answer.
+// A GET of the first bytes - HEAD gets refused by some servers.
+static int tinfoilKnows(const char* url) {
+    CURL* curl = curl_easy_init();
+    if (!curl) return -1;
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_RANGE, "0-1023");
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, +[](char*, size_t size, size_t nmemb, void*) -> size_t {
+        return size * nmemb;
+    });
+    struct curl_slist* headers = curl_slist_append(NULL, "User-Agent: SwitchRPC/1.0");
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    int r = -1;
+    if (curl_easy_perform(curl) == CURLE_OK) {
+        long code = 0;
+        char* type = NULL;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+        curl_easy_getinfo(curl, CURLINFO_CONTENT_TYPE, &type);
+        bool image = type && strncmp(type, "image/", 6) == 0;
+        if ((code == 200 || code == 206) && image) r = 1;
+        else if (code == 404 || code == 410 || code == 200 || code == 206) r = 0;
+    }
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    return r;
+}
+
 IconKind resolveIconUrl(u64 titleId, std::string& out_url, bool cacheOnly) {
     // a title with no icon anywhere: don't look it up again on every re-post
     static u64 noIconTid = 0;
+    // the hosts didn't answer for this title: ask again after a while, not on
+    // every re-post (a HOME press re-posts)
+    static u64 unknownTid = 0, unknownAt = 0;
+    // tinfoil never answered this boot: it's blocked here, so there's no telling
+    // official titles from homebrew - upload the title's own icon like before
+    static int tinfoilFails = 0, tinfoilOks = 0;
     // saved links already checked this boot (a check is a download)
     static std::set<u64> checkedLinks;
 
@@ -465,6 +479,11 @@ IconKind resolveIconUrl(u64 titleId, std::string& out_url, bool cacheOnly) {
     auto stillWorks = [&](const std::string& url, const char* path, bool ours) -> bool {
         if (checkedLinks.count(titleId)) return true;
         if (!ours && url.find("tinfoil") == std::string::npos) return true;
+        if (cacheOnly) {
+            // the status goes up right away with it; checked right after
+            g_iconCheckLater = true;
+            return true;
+        }
         int r = linkAlive(url.c_str());
         if (r == 0) {
             writeToLog("[Icon] Saved icon for %s is gone (%s), redoing it", titleIdStr, url.c_str());
@@ -491,16 +510,31 @@ IconKind resolveIconUrl(u64 titleId, std::string& out_url, bool cacheOnly) {
         kind = Icon_Homebrew;
     } else if (cacheOnly) {
         return Icon_Miss;  // caller shows the status now and comes back for the icon
+    } else if (titleId == unknownTid && getRawNowSec() - unknownAt < 10 * 60) {
+        out_url.clear();
+        return Icon_Unknown;
     } else if (fetchEshopIconUrl(titleId, out_url)) {
         kind = Icon_Official;
     } else {
         char tinfoil[64];
         snprintf(tinfoil, sizeof(tinfoil), "https://tinfoil.media/ti/%016llX/512/512/", (unsigned long long)titleId);
-        if (urlIsImage(tinfoil)) {
+        bool tinfoilDown = tinfoilFails >= 2 && tinfoilOks == 0;
+        int t = tinfoilDown ? 0 : tinfoilKnows(tinfoil);
+        if (t >= 0) tinfoilOks += !tinfoilDown;
+        else tinfoilFails++;
+        if (t > 0) {
             out_url = tinfoil;
             kind = Icon_Official;
             saveIconToCache(titleIdStr, tinfoil);
             writeToLog("[Icon] Using tinfoil icon: %s", tinfoil);
+        } else if (t < 0 && !(tinfoilFails >= 2 && tinfoilOks == 0)) {
+            // no answer: guessing "homebrew" here labelled official games
+            // "(homebrew)" and uploaded their (custom) icon - try again later
+            out_url.clear();
+            unknownTid = titleId;
+            unknownAt = getRawNowSec();
+            writeToLog("[Icon] No answer from tinfoil for %s, no icon for now", titleIdStr);
+            return Icon_Unknown;
         } else if (uploadOwnIcon(titleId, out_url)) {
             // forwarder / installed homebrew: its own icon
             kind = Icon_Homebrew;
@@ -751,22 +785,46 @@ void waitForNetworkReady() {
 // current process/title utilities
 
 // Return 0 on success, non-zero on error (int holds the libnx Result)
+// Some applications hold more than one program: Sonic Generations inside
+// SONIC X SHADOW GENERATIONS runs as 01005EA01C0FC001, the application is
+// ...C000. Name, icon, eShop page and playtime all belong to the application,
+// so map a running sub-program to it (once per program, it needs a lookup).
+static u64 applicationIdOf(u64 programId) {
+    static u64 lastProgram = 0, lastApp = 0;
+    if (programId == lastProgram) return lastApp;
+    u64 app = programId;
+    u64 base = programId & ~0xFFFULL;
+    if (base != programId) {
+        NsApplicationControlData* ctrl = (NsApplicationControlData*)malloc(sizeof(NsApplicationControlData));
+        u64 size = 0;
+        // the program itself isn't an installed application, but its base is
+        if (ctrl && R_FAILED(nsGetApplicationControlData(NsApplicationControlSource_Storage, programId, ctrl, sizeof(*ctrl), &size)) &&
+            R_SUCCEEDED(nsGetApplicationControlData(NsApplicationControlSource_Storage, base, ctrl, sizeof(*ctrl), &size))) {
+            app = base;
+            writeToLog("[SwitchRPC] Program %016llX belongs to application %016llX", (unsigned long long)programId,
+                       (unsigned long long)base);
+        }
+        free(ctrl);
+    }
+    lastProgram = programId;
+    lastApp = app;
+    return app;
+}
+
 Result get_app_tid(AppInfo *info) {
 	Result rc = pmdmntGetApplicationProcessId(&info->pid);
 	if (R_FAILED(rc)) return rc;
-	return pmdmntGetProgramId(&info->tid, info->pid);
+	u64 program = 0;
+	rc = pmdmntGetProgramId(&program, info->pid);
+	if (R_FAILED(rc)) return rc;
+	info->tid = applicationIdOf(program);
+	return 0;
 }
 
 Result get_app_info(AppInfo *info) {
-	u64 *out_pid = &info->pid;
 	u64 *out_tid = &info->tid;
 	
-	Result rc;
-	
-	rc = pmdmntGetApplicationProcessId(out_pid);
-	if (R_FAILED(rc)) return rc;
-	
-	rc = pmdmntGetProgramId(out_tid, *out_pid);
+	Result rc = get_app_tid(info);
 	if (R_FAILED(rc)) return rc;
 	
 	NsApplicationControlData* appControlData = (NsApplicationControlData*)malloc(sizeof(NsApplicationControlData));

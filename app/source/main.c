@@ -803,7 +803,7 @@ static json_object *cache_load(const char *path) {
 #define LANES 6
 #define FREEIMAGE_KEY "6d207e02198a847aa98d0a2a901485a5"
 
-typedef enum { St_Idle, St_Check, St_Eshop, St_Tinfoil, St_Catbox, St_Freeimage } Stage;
+typedef enum { St_Idle, St_Check, St_Eshop, St_Tinfoil, St_WaitUpload, St_Catbox, St_Freeimage } Stage;
 typedef enum { Save_Nothing, Save_Eshop, Save_Upload, Save_NoIcon } SaveTo;
 
 typedef struct {
@@ -824,7 +824,15 @@ typedef struct {
     json_object *eshop, *uploads, *checked;
     bool eshop_down;     // the eShop search is blocked here: don't wait on it
     int eshop_fails, eshop_oks;
+    bool tinfoil_down;   // same for tinfoil
+    int tinfoil_fails, tinfoil_oks;
+    int uploading;       // uploads running (at most UPLOADS, hosts throttle)
+    bool last_pass;      // the retry pass: a failure now is final
+    u64 *retry;          // titles to try again at the end (a host didn't answer)
+    int nretry;
 } Prep;
+
+#define UPLOADS 2
 
 static void lane_request(CURLM *m, Lane *l, Stage st) {
     l->st = st;
@@ -849,7 +857,7 @@ static void lane_request(CURLM *m, Lane *l, Stage st) {
         break;
     case St_Tinfoil:
         snprintf(url, sizeof(url), "https://tinfoil.media/ti/%016llX/512/512/", (unsigned long long)l->id);
-        curl_easy_setopt(c, CURLOPT_NOBODY, 1L);
+        curl_easy_setopt(c, CURLOPT_RANGE, "0-1023");  // some servers refuse HEAD
         break;
     default: {  // St_Catbox / St_Freeimage
         bool catbox = st == St_Catbox;
@@ -887,7 +895,9 @@ static void lane_request(CURLM *m, Lane *l, Stage st) {
     curl_multi_add_handle(m, c);
 }
 
-static void lane_abort(CURLM *m, Lane *l) {
+static void lane_abort(CURLM *m, Prep *p, Lane *l) {
+    if (l->c && (l->st == St_Catbox || l->st == St_Freeimage))
+        p->uploading--;
     if (l->c) {
         curl_multi_remove_handle(m, l->c);
         curl_easy_cleanup(l->c);
@@ -914,12 +924,36 @@ static void lane_finish(CURLM *m, Prep *p, Lane *l, SaveTo save, const char *url
     }
     job_line(j, color, "%s: %s", l->name, what);
     j->done++;
-    lane_abort(m, l);
+    lane_abort(m, p, l);
+}
+
+// a host didn't answer for this title: try it again at the end, slower -
+// guessing "unknown title" here is what labelled official games "(homebrew)"
+static void lane_retry(CURLM *m, Prep *p, Lane *l, const char *why) {
+    if (p->last_pass) {
+        char what[220];
+        snprintf(what, sizeof(what), "%s - tried again next time", why);
+        p->j->failed++;
+        lane_finish(m, p, l, Save_Nothing, NULL, "\x1b[31m", what);
+        return;
+    }
+    u64 *more = realloc(p->retry, sizeof(u64) * (p->nretry + 1));
+    if (more) {
+        p->retry = more;
+        p->retry[p->nretry++] = l->id;
+    }
+    lane_abort(m, p, l);
+}
+
+static void start_upload(CURLM *m, Prep *p, Lane *l, Stage st) {
+    p->uploading++;
+    lane_request(m, l, st);
 }
 
 static void lane_after_tinfoil(CURLM *m, Prep *p, Lane *l) {
     if (l->icon) {
-        lane_request(m, l, St_Catbox);
+        if (p->uploading < UPLOADS) start_upload(m, p, l, St_Catbox);
+        else l->st = St_WaitUpload;  // started by the main loop when a slot frees up
     } else {
         lane_finish(m, p, l, Save_NoIcon, NULL, "\x1b[2m", "has no icon of its own");
     }
@@ -947,7 +981,7 @@ static void lane_done(CURLM *m, Prep *p, Lane *l, CURLcode rc) {
         } else {
             j->skipped++;
             j->done++;
-            lane_abort(m, l);
+            lane_abort(m, p, l);
         }
         return;
     case St_Eshop: {
@@ -979,19 +1013,33 @@ static void lane_done(CURLM *m, Prep *p, Lane *l, CURLcode rc) {
         }
         return;
     }
-    case St_Tinfoil:
-        if (rc == CURLE_OK && code == 200 && image) {
+    case St_Tinfoil: {
+        bool known = rc == CURLE_OK && (code == 200 || code == 206) && image;
+        // tinfoil has every official title: "not there" means homebrew / forwarder
+        bool unknown = rc == CURLE_OK && (code == 404 || code == 410 || ((code == 200 || code == 206) && !image));
+        if (known || unknown) p->tinfoil_oks++;
+        if (known) {
             char tf[80];
             snprintf(tf, sizeof(tf), "https://tinfoil.media/ti/%016llX/512/512/", (unsigned long long)l->id);
             j->found++;
             lane_finish(m, p, l, Save_Eshop, tf, "\x1b[32m", "tinfoil icon");
-        } else {
-            lane_after_tinfoil(m, p, l);
+            return;
         }
+        if (!unknown && !p->tinfoil_down && ++p->tinfoil_fails >= 2 && p->tinfoil_oks == 0) {
+            // never answered: blocked here, so there's no telling official from homebrew
+            p->tinfoil_down = true;
+            job_line(j, "\x1b[33m", "tinfoil doesn't answer here - using the titles' own icons.");
+        }
+        if (unknown || p->tinfoil_down)
+            lane_after_tinfoil(m, p, l);
+        else
+            lane_retry(m, p, l, "couldn't reach tinfoil");
         return;
+    }
     case St_Catbox:
     case St_Freeimage: {
         bool catbox = l->st == St_Catbox;
+        p->uploading--;
         char url[300] = "";
         if (rc != CURLE_OK) {
             snprintf(l->err + strlen(l->err), sizeof(l->err) - strlen(l->err), "%s%s: %s",
@@ -1016,12 +1064,12 @@ static void lane_done(CURLM *m, Prep *p, Lane *l, CURLcode rc) {
             snprintf(l->err + strlen(l->err), sizeof(l->err) - strlen(l->err), "%s%s: HTTP %ld",
                      l->err[0] ? " / " : "", catbox ? "catbox" : "freeimage", code);
         if (catbox) {
-            lane_request(m, l, St_Freeimage);
+            start_upload(m, p, l, St_Freeimage);
         } else {
-            char what[220];
-            snprintf(what, sizeof(what), "upload failed (%s) - tried again next time", l->err);
-            j->failed++;
-            lane_finish(m, p, l, Save_Nothing, NULL, "\x1b[31m", what);
+            char why[200];
+            snprintf(why, sizeof(why), "upload failed (%s)", l->err);
+            l->err[0] = '\0';
+            lane_retry(m, p, l, why);
         }
         return;
     }
@@ -1111,12 +1159,28 @@ static void prepare_icons(IconJob *j, PadState *pad, bool from_scratch) {
     bool stop = false;
     u64 last_draw = 0;
     while (ctrl && m) {
-        // keep every lane busy
-        for (int k = 0; k < LANES && next < n && !stop; k++)
+        // keep every lane busy (fewer in the retry pass, to go easy on the hosts)
+        for (int k = 0; k < (p.last_pass ? 2 : LANES) && next < n && !stop; k++)
             while (lanes[k].st == St_Idle && next < n)
-                lane_start(m, &p, &lanes[k], ids[next++], ctrl, from_scratch);
+                lane_start(m, &p, &lanes[k], ids[next++], ctrl, from_scratch || p.last_pass);
+        for (int k = 0; k < LANES && p.uploading < UPLOADS; k++)
+            if (lanes[k].st == St_WaitUpload) start_upload(m, &p, &lanes[k], St_Catbox);
         int busy = 0;
         for (int k = 0; k < LANES; k++) busy += lanes[k].st != St_Idle;
+        if (!busy && next >= n && p.nretry && !p.last_pass) {
+            // a second, slower go at what a host didn't answer for
+            job_line(j, "", "Trying %d title(s) again that a server didn't answer for...", p.nretry);
+            draw_icons(j, false);
+            svcSleepThread(2000000000ULL);
+            free(ids);
+            ids = p.retry;
+            n = p.nretry;
+            next = 0;
+            p.retry = NULL;
+            p.nretry = 0;
+            p.last_pass = true;
+            continue;
+        }
         if (!busy) break;
 
         int running = 0;
@@ -1133,7 +1197,7 @@ static void prepare_icons(IconJob *j, PadState *pad, bool from_scratch) {
 
         padUpdate(pad);
         if (padGetButtonsDown(pad) & HidNpadButton_B) {
-            for (int k = 0; k < LANES; k++) lane_abort(m, &lanes[k]);
+            for (int k = 0; k < LANES; k++) lane_abort(m, &p, &lanes[k]);
             job_line(j, "\x1b[33m", "Stopped.");
             stop = true;
             break;
@@ -1147,6 +1211,7 @@ static void prepare_icons(IconJob *j, PadState *pad, bool from_scratch) {
     curl_multi_cleanup(m);
     free(ctrl);
     free(ids);
+    free(p.retry);
     json_object_put(p.eshop);
     json_object_put(p.uploads);
     json_object_put(p.checked);

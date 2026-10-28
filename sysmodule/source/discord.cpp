@@ -602,8 +602,21 @@ static bool replaceSession(u64 titleId, const std::string& name, u64 startRawSec
 }
 
 bool discordShow(u64 titleId, std::string name, u64 startRawSec, const ActivityOpts& opts) {
+    g_iconCheckLater = false;
     if (!replaceSession(titleId, name, startRawSec, opts, true))
         return false;
+    // posted with a saved icon link that wasn't checked this boot yet: check it
+    // now, and only if the host deleted it, post again with the redone icon
+    if (!g_iconPending && g_iconCheckLater && !opts.icon) {
+        g_iconCheckLater = false;
+        std::string url;
+        resolveIconUrl(titleId, url, false);
+        if (url != g_lastIconUrl) {
+            writeToLog("[Discord] Saved icon link was dead, re-posting with the new one.");
+            replaceSession(titleId, name, startRawSec, opts, false);
+        }
+        return true;
+    }
     // icon / eShop page weren't cached: look them up now and show them
     if (g_iconPending) {
         writeToLog("[Discord] Icon or eShop page not cached yet, looking up and re-posting.");
@@ -634,6 +647,16 @@ void discordLogout() {
     // refresh (and rewrite) the token file, so we still have valid auth here.
     discordDeleteHeadlessSession();
     discordCleanupStaleSessions();
+    // then revoke the login itself. Discord keeps a status it wasn't told to
+    // delete for as long as the app is authorized - a logout that couldn't
+    // delete it (offline, a lost session) left it there for good, and only
+    // removing the authorization in Discord's settings cleared it
+    if (!refreshToken.empty()) {
+        std::string body = "token=" + refreshToken + "&token_type_hint=refresh_token&client_id=" + clientId;
+        struct curl_slist* headers = curl_slist_append(NULL, "Content-Type: application/x-www-form-urlencoded; charset=utf-8");
+        bool ok = sendRequest("https://gaming-sdk.com/api/v9/oauth2/token/revoke", "POST", headers, body.c_str(), NULL);
+        writeToLog(ok ? "[Discord] Login revoked." : "[Discord] Couldn't revoke the login (%s).", g_lastError.c_str());
+    }
     // now forget everything and make sure we stay logged out even if a refresh
     // just rewrote the token file
     refreshToken = "";
