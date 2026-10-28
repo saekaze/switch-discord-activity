@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.1.6] - 2026-10-28
+
+### Changed
+- **Prepare icons is much faster**, both *from scratch* and *new titles only*: it works on 6 titles at once instead of one after the other, and when the eShop search doesn't answer (blocked in some countries) it stops asking after the first tries and goes straight to tinfoil. Icons are made the same way as in 1.0: the eShop icon, else tinfoil's, else the title's own icon uploaded (catbox.moe, freeimage.host as a fallback).
+
 ## [1.1.5] - 2026-10-28
 
 ### Fixed

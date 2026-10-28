@@ -795,206 +795,281 @@ static json_object *cache_load(const char *path) {
     return o;
 }
 
-static size_t sink(char *p, size_t s, size_t n, void *u) { (void)p; (void)u; return s * n; }
+// Several titles are worked on at once (one thread, curl's multi interface):
+// each request is mostly waiting on the network, so doing them one after the
+// other made a full run take minutes. Per title, same as 1.0: the eShop icon,
+// else tinfoil's, else the title's own icon uploaded (catbox.moe, then
+// freeimage.host).
+#define LANES 6
+#define FREEIMAGE_KEY "6d207e02198a847aa98d0a2a901485a5"
 
-static bool url_is_image(const char *url) {
+typedef enum { St_Idle, St_Check, St_Eshop, St_Tinfoil, St_Catbox, St_Freeimage } Stage;
+typedef enum { Save_Nothing, Save_Eshop, Save_Upload, Save_NoIcon } SaveTo;
+
+typedef struct {
+    Stage st;
+    u64 id;
+    char tid[17], name[100];
+    char saved[300];     // St_Check: the saved upload link
+    u8 *icon;            // the title's own icon (NULL = it has none)
+    size_t icon_len;
+    CURL *c;
+    curl_mime *mime;
+    char *resp;
+    char err[160];
+} Lane;
+
+typedef struct {
+    IconJob *j;
+    json_object *eshop, *uploads, *checked;
+    bool eshop_down;     // the eShop search is blocked here: don't wait on it
+    int eshop_fails, eshop_oks;
+} Prep;
+
+static void lane_request(CURLM *m, Lane *l, Stage st) {
+    l->st = st;
+    free(l->resp);
+    l->resp = NULL;
+    l->mime = NULL;
     CURL *c = curl_easy_init();
-    if (!c) return false;
+    l->c = c;
+    char url[300];
+    long timeout = 10;
+    switch (st) {
+    case St_Check:
+        // a real download of the first bytes: catbox answers HEAD with 200
+        // even for files that are gone
+        snprintf(url, sizeof(url), "%s", l->saved);
+        curl_easy_setopt(c, CURLOPT_RANGE, "0-1023");
+        break;
+    case St_Eshop:
+        snprintf(url, sizeof(url),
+                 "https://searching.nintendo-europe.com/en/select?q=application_id_s%%3A%s&wt=json&fq=type%%3AGAME"
+                 "&fl=application_id_s%%2Cimage_url_sq_s&rows=5", l->tid);
+        break;
+    case St_Tinfoil:
+        snprintf(url, sizeof(url), "https://tinfoil.media/ti/%016llX/512/512/", (unsigned long long)l->id);
+        curl_easy_setopt(c, CURLOPT_NOBODY, 1L);
+        break;
+    default: {  // St_Catbox / St_Freeimage
+        bool catbox = st == St_Catbox;
+        snprintf(url, sizeof(url), "%s", catbox ? "https://catbox.moe/user/api.php" : "https://freeimage.host/api/1/upload");
+        curl_mime *mime = curl_mime_init(c);
+        curl_mimepart *part;
+        if (catbox) {
+            part = curl_mime_addpart(mime); curl_mime_name(part, "reqtype"); curl_mime_data(part, "fileupload", CURL_ZERO_TERMINATED);
+            part = curl_mime_addpart(mime); curl_mime_name(part, "fileToUpload");
+        } else {
+            part = curl_mime_addpart(mime); curl_mime_name(part, "key");    curl_mime_data(part, FREEIMAGE_KEY, CURL_ZERO_TERMINATED);
+            part = curl_mime_addpart(mime); curl_mime_name(part, "action"); curl_mime_data(part, "upload", CURL_ZERO_TERMINATED);
+            part = curl_mime_addpart(mime); curl_mime_name(part, "format"); curl_mime_data(part, "json", CURL_ZERO_TERMINATED);
+            part = curl_mime_addpart(mime); curl_mime_name(part, "source");
+        }
+        curl_mime_filename(part, "icon.jpg");
+        curl_mime_type(part, "image/jpeg");
+        curl_mime_data(part, (const char *)l->icon, l->icon_len);
+        curl_easy_setopt(c, CURLOPT_MIMEPOST, mime);
+        l->mime = mime;
+        timeout = 40;
+        break;
+    }
+    }
     curl_easy_setopt(c, CURLOPT_URL, url);
-    curl_easy_setopt(c, CURLOPT_NOBODY, 1L);
+    curl_easy_setopt(c, CURLOPT_USERAGENT, "SwitchRPC/1.0");
     curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, 0L);
     curl_easy_setopt(c, CURLOPT_SSL_VERIFYHOST, 0L);
-    curl_easy_setopt(c, CURLOPT_TIMEOUT, 10L);
-    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, sink);
-    bool ok = false;
-    if (curl_easy_perform(c) == CURLE_OK) {
-        long code = 0; char *type = NULL;
-        curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
-        curl_easy_getinfo(c, CURLINFO_CONTENT_TYPE, &type);
-        ok = code == 200 && type && !strncmp(type, "image/", 6);
-    }
-    curl_easy_cleanup(c);
-    return ok;
+    curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 5L);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, timeout);
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, collect);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, &l->resp);
+    curl_easy_setopt(c, CURLOPT_PRIVATE, l);
+    curl_multi_add_handle(m, c);
 }
 
-// Is a saved icon link still there? 1 = yes, 0 = gone (404/410), -1 = can't
-// tell (offline, host down). A real download of the first bytes: catbox
-// answers a HEAD request with 200 even for files that don't exist.
-static int link_alive(const char *url) {
-    CURL *c = curl_easy_init();
-    if (!c) return -1;
-    curl_easy_setopt(c, CURLOPT_URL, url);
-    curl_easy_setopt(c, CURLOPT_RANGE, "0-1023");
-    curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, 0L);
-    curl_easy_setopt(c, CURLOPT_SSL_VERIFYHOST, 0L);
-    curl_easy_setopt(c, CURLOPT_TIMEOUT, 10L);
-    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, sink);
-    int r = -1;
-    if (curl_easy_perform(c) == CURLE_OK) {
-        long code = 0; char *type = NULL;
-        curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
-        curl_easy_getinfo(c, CURLINFO_CONTENT_TYPE, &type);
-        if ((code == 200 || code == 206) && type && !strncmp(type, "image/", 6)) r = 1;
-        else if (code == 404 || code == 410) r = 0;
+static void lane_abort(CURLM *m, Lane *l) {
+    if (l->c) {
+        curl_multi_remove_handle(m, l->c);
+        curl_easy_cleanup(l->c);
+        l->c = NULL;
     }
-    curl_easy_cleanup(c);
-    return r;
+    if (l->mime) { curl_mime_free(l->mime); l->mime = NULL; }
+    free(l->resp); l->resp = NULL;
+    free(l->icon); l->icon = NULL;
+    l->st = St_Idle;
 }
 
-// Nintendo's EU eShop search, same query as the module.
-// 1 = found, 0 = the eShop doesn't list it, -1 = couldn't ask (try again later)
-static int eshop_icon(const char *tid, char *out, size_t size) {
-    char url[512];
-    snprintf(url, sizeof(url),
-             "https://searching.nintendo-europe.com/en/select?q=application_id_s%%3A%s&wt=json&fq=type%%3AGAME"
-             "&fl=application_id_s%%2Cimage_url_sq_s&rows=5", tid);
-    char err[128]; long code;
-    char *resp = discord_req(url, "GET", NULL, NULL, NULL, &code, err, sizeof(err));
-    if (!resp || code != 200) {
-        free(resp);
-        return -1;
+// the title is done (or failed): save what we learned, print one line
+static void lane_finish(CURLM *m, Prep *p, Lane *l, SaveTo save, const char *url,
+                        const char *color, const char *what) {
+    IconJob *j = p->j;
+    if (save == Save_Eshop) json_object_object_add(p->eshop, l->tid, json_object_new_string(url));
+    else if (save == Save_Upload) json_object_object_add(p->uploads, l->tid, json_object_new_string(url));
+    else if (save == Save_NoIcon) json_object_object_add(p->checked, l->tid, json_object_new_string("none"));
+    if (save != Save_Nothing) {
+        // saved as we go, so stopping halfway keeps what's done
+        json_object_to_file_ext(ESHOP_CACHE, p->eshop, JSON_C_TO_STRING_PLAIN);
+        json_object_to_file_ext(UPLOAD_CACHE, p->uploads, JSON_C_TO_STRING_PLAIN);
+        json_object_to_file_ext(CHECKED_CACHE, p->checked, JSON_C_TO_STRING_PLAIN);
     }
-    int found = 0;
-    json_object *root = json_tokener_parse(resp), *r, *docs;
-    if (!root) found = -1;
-    if (root && json_object_object_get_ex(root, "response", &r) && json_object_object_get_ex(r, "docs", &docs)) {
-        for (size_t i = 0; i < json_object_array_length(docs) && !found; i++) {
-            json_object *doc = json_object_array_get_idx(docs, i);
-            const char *id = jstr(doc, "application_id_s"), *img = jstr(doc, "image_url_sq_s");
-            if (id && img && !strcasecmp(id, tid)) {
-                snprintf(out, size, "%s", img);
-                found = 1;
+    job_line(j, color, "%s: %s", l->name, what);
+    j->done++;
+    lane_abort(m, l);
+}
+
+static void lane_after_tinfoil(CURLM *m, Prep *p, Lane *l) {
+    if (l->icon) {
+        lane_request(m, l, St_Catbox);
+    } else {
+        lane_finish(m, p, l, Save_NoIcon, NULL, "\x1b[2m", "has no icon of its own");
+    }
+}
+
+// one request finished: decide the next step for that title
+static void lane_done(CURLM *m, Prep *p, Lane *l, CURLcode rc) {
+    IconJob *j = p->j;
+    long code = 0;
+    char *type = NULL;
+    curl_easy_getinfo(l->c, CURLINFO_RESPONSE_CODE, &code);
+    curl_easy_getinfo(l->c, CURLINFO_CONTENT_TYPE, &type);
+    bool image = type && !strncmp(type, "image/", 6);
+    curl_multi_remove_handle(m, l->c);
+    curl_easy_cleanup(l->c);
+    l->c = NULL;
+    if (l->mime) { curl_mime_free(l->mime); l->mime = NULL; }
+
+    switch (l->st) {
+    case St_Check:
+        if (rc == CURLE_OK && (code == 404 || code == 410)) {
+            json_object_object_del(p->uploads, l->tid);
+            job_line(j, "\x1b[33m", "%s: saved icon link stopped working - redoing it", l->name);
+            lane_request(m, l, p->eshop_down ? St_Tinfoil : St_Eshop);
+        } else {
+            j->skipped++;
+            j->done++;
+            lane_abort(m, l);
+        }
+        return;
+    case St_Eshop: {
+        if (rc != CURLE_OK || code != 200) {
+            // two failures before any answer: it's blocked here, skip it for the rest
+            if (++p->eshop_fails >= 2 && p->eshop_oks == 0 && !p->eshop_down) {
+                p->eshop_down = true;
+                job_line(j, "\x1b[33m", "The eShop search doesn't answer here - using tinfoil and the titles' own icons.");
+            }
+            lane_request(m, l, St_Tinfoil);
+            return;
+        }
+        p->eshop_oks++;
+        char found[300] = "";
+        json_object *root = json_tokener_parse(l->resp ? l->resp : ""), *r, *docs;
+        if (root && json_object_object_get_ex(root, "response", &r) && json_object_object_get_ex(r, "docs", &docs)) {
+            for (size_t i = 0; i < json_object_array_length(docs) && !found[0]; i++) {
+                json_object *doc = json_object_array_get_idx(docs, i);
+                const char *id = jstr(doc, "application_id_s"), *img = jstr(doc, "image_url_sq_s");
+                if (id && img && !strcasecmp(id, l->tid)) snprintf(found, sizeof(found), "%s", img);
             }
         }
-    }
-    json_object_put(root);
-    free(resp);
-    return found;
-}
-
-static bool upload_icon(const u8 *data, size_t len, bool catbox, char *out, size_t size, char *err, size_t err_size) {
-    CURL *c = curl_easy_init();
-    if (!c) { snprintf(err, err_size, "curl init"); return false; }
-    curl_mime *mime = curl_mime_init(c);
-    curl_mimepart *part;
-    if (catbox) {
-        part = curl_mime_addpart(mime); curl_mime_name(part, "reqtype"); curl_mime_data(part, "fileupload", CURL_ZERO_TERMINATED);
-        part = curl_mime_addpart(mime); curl_mime_name(part, "fileToUpload");
-    } else {
-        part = curl_mime_addpart(mime); curl_mime_name(part, "key");    curl_mime_data(part, "6d207e02198a847aa98d0a2a901485a5", CURL_ZERO_TERMINATED);
-        part = curl_mime_addpart(mime); curl_mime_name(part, "action"); curl_mime_data(part, "upload", CURL_ZERO_TERMINATED);
-        part = curl_mime_addpart(mime); curl_mime_name(part, "format"); curl_mime_data(part, "json", CURL_ZERO_TERMINATED);
-        part = curl_mime_addpart(mime); curl_mime_name(part, "source");
-    }
-    curl_mime_filename(part, "icon.jpg");
-    curl_mime_type(part, "image/jpeg");
-    curl_mime_data(part, (const char *)data, len);
-
-    char *resp = NULL;
-    curl_easy_setopt(c, CURLOPT_URL, catbox ? "https://catbox.moe/user/api.php" : "https://freeimage.host/api/1/upload");
-    curl_easy_setopt(c, CURLOPT_MIMEPOST, mime);
-    curl_easy_setopt(c, CURLOPT_USERAGENT, "SwitchRPC/1.0");
-    curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, 0L);
-    curl_easy_setopt(c, CURLOPT_SSL_VERIFYHOST, 0L);
-    curl_easy_setopt(c, CURLOPT_TIMEOUT, 40L);
-    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, collect);
-    curl_easy_setopt(c, CURLOPT_WRITEDATA, &resp);
-    CURLcode rc = curl_easy_perform(c);
-    long code = 0;
-    curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
-    curl_mime_free(mime);
-    curl_easy_cleanup(c);
-
-    bool ok = false;
-    if (rc != CURLE_OK) {
-        snprintf(err, err_size, "%s", curl_easy_strerror(rc));
-    } else if (code != 200 || !resp) {
-        snprintf(err, err_size, "HTTP %ld %.60s", code, resp ? resp : "");
-    } else if (catbox) {
-        // plain text answer: the file URL
-        resp[strcspn(resp, "\r\n")] = '\0';
-        ok = !strncmp(resp, "https://", 8);
-        if (ok) snprintf(out, size, "%s", resp); else snprintf(err, err_size, "%.60s", resp);
-    } else {
-        json_object *root = json_tokener_parse(resp), *img, *u;
-        if (root && json_object_object_get_ex(root, "image", &img) && json_object_object_get_ex(img, "url", &u)) {
-            snprintf(out, size, "%s", json_object_get_string(u));
-            ok = !strncmp(out, "https://", 8);
-        }
-        if (!ok) snprintf(err, err_size, "unexpected answer %.50s", resp);
         json_object_put(root);
+        if (found[0]) {
+            j->found++;
+            lane_finish(m, p, l, Save_Eshop, found, "\x1b[32m", "eShop icon");
+        } else {
+            lane_request(m, l, St_Tinfoil);
+        }
+        return;
     }
-    free(resp);
-    return ok;
+    case St_Tinfoil:
+        if (rc == CURLE_OK && code == 200 && image) {
+            char tf[80];
+            snprintf(tf, sizeof(tf), "https://tinfoil.media/ti/%016llX/512/512/", (unsigned long long)l->id);
+            j->found++;
+            lane_finish(m, p, l, Save_Eshop, tf, "\x1b[32m", "tinfoil icon");
+        } else {
+            lane_after_tinfoil(m, p, l);
+        }
+        return;
+    case St_Catbox:
+    case St_Freeimage: {
+        bool catbox = l->st == St_Catbox;
+        char url[300] = "";
+        if (rc != CURLE_OK) {
+            snprintf(l->err + strlen(l->err), sizeof(l->err) - strlen(l->err), "%s%s: %s",
+                     l->err[0] ? " / " : "", catbox ? "catbox" : "freeimage", curl_easy_strerror(rc));
+        } else if (code == 200 && l->resp && catbox) {
+            // plain text answer: the file URL
+            l->resp[strcspn(l->resp, "\r\n")] = '\0';
+            if (!strncmp(l->resp, "https://", 8)) snprintf(url, sizeof(url), "%s", l->resp);
+        } else if (code == 200 && l->resp) {
+            json_object *root = json_tokener_parse(l->resp), *img, *u;
+            if (root && json_object_object_get_ex(root, "image", &img) && json_object_object_get_ex(img, "url", &u) &&
+                !strncmp(json_object_get_string(u), "https://", 8))
+                snprintf(url, sizeof(url), "%s", json_object_get_string(u));
+            json_object_put(root);
+        }
+        if (url[0]) {
+            j->uploaded++;
+            lane_finish(m, p, l, Save_Upload, url, "\x1b[32m", catbox ? "uploaded (catbox)" : "uploaded (freeimage)");
+            return;
+        }
+        if (rc == CURLE_OK)
+            snprintf(l->err + strlen(l->err), sizeof(l->err) - strlen(l->err), "%s%s: HTTP %ld",
+                     l->err[0] ? " / " : "", catbox ? "catbox" : "freeimage", code);
+        if (catbox) {
+            lane_request(m, l, St_Freeimage);
+        } else {
+            char what[220];
+            snprintf(what, sizeof(what), "upload failed (%s) - tried again next time", l->err);
+            j->failed++;
+            lane_finish(m, p, l, Save_Nothing, NULL, "\x1b[31m", what);
+        }
+        return;
+    }
+    default:
+        return;
+    }
 }
 
-// one title that isn't in any cache yet
-static void prepare_one(IconJob *j, u64 app_id, NsApplicationControlData *ctrl,
-                        json_object *eshop, json_object *uploads, json_object *checked) {
-    char tid[17];
-    snprintf(tid, sizeof(tid), "%016llx", (unsigned long long)app_id);
+// starts a title in a free lane; false = nothing to do for it (skipped)
+static bool lane_start(CURLM *m, Prep *p, Lane *l, u64 id, NsApplicationControlData *ctrl, bool from_scratch) {
+    IconJob *j = p->j;
+    memset(l, 0, sizeof(*l));
+    l->id = id;
+    snprintf(l->tid, sizeof(l->tid), "%016llx", (unsigned long long)id);
+    json_object *tmp;
+    bool check = false;
+    if (!from_scratch) {
+        if (json_object_object_get_ex(p->uploads, l->tid, &tmp)) {
+            // uploaded before: only make sure the link still works
+            snprintf(l->saved, sizeof(l->saved), "%s", json_object_get_string(tmp));
+            check = true;
+        } else if (json_object_object_get_ex(p->eshop, l->tid, &tmp) ||
+                   json_object_object_get_ex(p->checked, l->tid, &tmp)) {
+            j->skipped++;
+            j->done++;
+            return false;
+        }
+    }
     u64 actual = 0;
-    char name[100] = "?";
-    bool have_ctrl = R_SUCCEEDED(nsGetApplicationControlData(NsApplicationControlSource_Storage,
-                                 app_id, ctrl, sizeof(*ctrl), &actual));
-    if (have_ctrl) {
+    snprintf(l->name, sizeof(l->name), "?");
+    if (R_SUCCEEDED(nsGetApplicationControlData(NsApplicationControlSource_Storage, id, ctrl, sizeof(*ctrl), &actual))) {
         NacpLanguageEntry *le = NULL;
         if (R_SUCCEEDED(nacpGetLanguageEntry(&ctrl->nacp, &le)) && le && le->name[0])
-            snprintf(name, sizeof(name), "%.*s", (int)ui_text_fit(le->name, 30, false), le->name);
+            snprintf(l->name, sizeof(l->name), "%.*s", (int)ui_text_fit(le->name, 30, false), le->name);
+        if (actual > sizeof(ctrl->nacp)) {
+            l->icon_len = actual - sizeof(ctrl->nacp);
+            l->icon = malloc(l->icon_len);
+            if (l->icon) memcpy(l->icon, ctrl->icon, l->icon_len);
+        }
     }
-
-    char url[300], err[128] = "";
-    // the eShop search can be unreachable (some countries/networks block
-    // it) - then tinfoil and the title's own icon still work
-    int es = eshop_icon(tid, url, sizeof(url));
-    if (es > 0) {
-        json_object_object_add(eshop, tid, json_object_new_string(url));
-        j->found++;
-        job_line(j, "\x1b[32m", "%s: eShop icon", name);
-        return;
-    }
-    char tf[80];
-    snprintf(tf, sizeof(tf), "https://tinfoil.media/ti/%016llX/512/512/", (unsigned long long)app_id);
-    if (url_is_image(tf)) {
-        json_object_object_add(eshop, tid, json_object_new_string(tf));
-        j->found++;
-        job_line(j, "\x1b[32m", "%s: tinfoil icon", name);
-        return;
-    }
-    if (!have_ctrl || actual <= sizeof(ctrl->nacp)) {
-        json_object_object_add(checked, tid, json_object_new_string("none"));
-        job_line(j, "\x1b[2m", "%s: has no icon of its own", name);
-        return;
-    }
-    size_t len = actual - sizeof(ctrl->nacp);
-    // catbox first: it keeps files as long as they're looked at; freeimage
-    // deleted some icons uploaded through the shared API key
-    bool ok = upload_icon(ctrl->icon, len, true, url, sizeof(url), err, sizeof(err));
-    const char *host = "catbox";
-    if (!ok) {
-        char err2[128];
-        ok = upload_icon(ctrl->icon, len, false, url, sizeof(url), err2, sizeof(err2));
-        host = "freeimage";
-        if (!ok) { strncat(err, " / freeimage: ", sizeof(err) - strlen(err) - 1);
-                   strncat(err, err2, sizeof(err) - strlen(err) - 1); }
-    }
-    if (ok) {
-        json_object_object_add(uploads, tid, json_object_new_string(url));
-        j->uploaded++;
-        job_line(j, "\x1b[32m", "%s: uploaded (%s)", name, host);
-    } else {
-        j->failed++;
-        job_line(j, "\x1b[31m", "%s: upload failed: %s", name, err);
-    }
+    lane_request(m, l, check ? St_Check : p->eshop_down ? St_Tinfoil : St_Eshop);
+    return true;
 }
 
 // Goes through every installed title.
-//  - new titles only: titles done before are skipped, except that saved links
-//    to uploaded / tinfoil icons are checked and redone when they stopped
-//    working (image hosts do delete files). Titles known to have no icon of
-//    their own are skipped too.
+//  - new titles only: titles done before are skipped (uploaded icons just get
+//    their link checked, and are redone if the host deleted them); titles known
+//    to have no icon of their own are skipped too.
 //  - from scratch: every saved answer is forgotten and every title redone.
 static void prepare_icons(IconJob *j, PadState *pad, bool from_scratch) {
     memset(j, 0, sizeof(*j));
@@ -1002,74 +1077,87 @@ static void prepare_icons(IconJob *j, PadState *pad, bool from_scratch) {
         job_line(j, "\x1b[31m", "Can't open the title list (ns).");
         return;
     }
-    json_object *eshop, *uploads, *checked;
-    if (from_scratch) {
-        eshop = json_object_new_object();
-        uploads = json_object_new_object();
-        checked = json_object_new_object();
-    } else {
-        eshop = cache_load(ESHOP_CACHE);
-        uploads = cache_load(UPLOAD_CACHE);
-        checked = cache_load(CHECKED_CACHE);
-    }
-    NsApplicationControlData *ctrl = malloc(sizeof(*ctrl));
-
+    // every installed title first (cheap), then the network part
+    u64 *ids = NULL;
+    s32 n = 0;
     static NsApplicationRecord recs[64];
     s32 offset = 0, count = 0;
-    bool stop = false;
-    job_line(j, "", from_scratch ? "Preparing every installed title again..." :
-                                   "Checking installed titles and saved icon links...");
-    while (ctrl && !stop && R_SUCCEEDED(nsListApplicationRecord(recs, 64, offset, &count)) && count > 0) {
-        for (s32 i = 0; i < count && !stop; i++) {
-            padUpdate(pad);
-            if (padGetButtonsDown(pad) & HidNpadButton_B) { job_line(j, "\x1b[33m", "Stopped."); stop = true; break; }
-            j->total++;
-            j->done++;
-            char tid[17];
-            snprintf(tid, sizeof(tid), "%016llx", (unsigned long long)recs[i].application_id);
-            json_object *tmp;
-            bool redo = false;
-            if (json_object_object_get_ex(uploads, tid, &tmp) ||
-                (json_object_object_get_ex(eshop, tid, &tmp) && strstr(json_object_get_string(tmp), "tinfoil"))) {
-                // a link we (or tinfoil) host: make sure it still works
-                if (j->done % 4 == 0) draw_icons(j, false);
-                if (link_alive(json_object_get_string(tmp)) == 0) {
-                    json_object_object_del(uploads, tid);
-                    json_object_object_del(eshop, tid);
-                    j->repaired++;
-                    redo = true;
-                }
-            }
-            if (!redo && (json_object_object_get_ex(eshop, tid, &tmp) || json_object_object_get_ex(uploads, tid, &tmp) ||
-                          json_object_object_get_ex(checked, tid, &tmp))) {
-                j->skipped++;
-                continue;
-            }
-            draw_icons(j, false);
-            if (redo) job_line(j, "\x1b[33m", "Saved icon link stopped working - redoing it:");
-            prepare_one(j, recs[i].application_id, ctrl, eshop, uploads, checked);
-            // save as we go, so stopping halfway keeps what's done
-            json_object_to_file_ext(ESHOP_CACHE, eshop, JSON_C_TO_STRING_PLAIN);
-            json_object_to_file_ext(UPLOAD_CACHE, uploads, JSON_C_TO_STRING_PLAIN);
-            json_object_to_file_ext(CHECKED_CACHE, checked, JSON_C_TO_STRING_PLAIN);
-            draw_icons(j, false);
-        }
+    while (R_SUCCEEDED(nsListApplicationRecord(recs, 64, offset, &count)) && count > 0) {
+        u64 *more = realloc(ids, sizeof(u64) * (n + count));
+        if (!more) break;
+        ids = more;
+        for (s32 i = 0; i < count; i++) ids[n++] = recs[i].application_id;
         offset += count;
     }
-    // from scratch and stopped early: what wasn't reached yet is simply new next time
+    j->total = n;
+
+    Prep p = { .j = j };
+    if (from_scratch) {
+        p.eshop = json_object_new_object();
+        p.uploads = json_object_new_object();
+        p.checked = json_object_new_object();
+    } else {
+        p.eshop = cache_load(ESHOP_CACHE);
+        p.uploads = cache_load(UPLOAD_CACHE);
+        p.checked = cache_load(CHECKED_CACHE);
+    }
+    NsApplicationControlData *ctrl = malloc(sizeof(*ctrl));
+    CURLM *m = curl_multi_init();
+    static Lane lanes[LANES];
+    memset(lanes, 0, sizeof(lanes));
+    job_line(j, "", from_scratch ? "Preparing every installed title again..." : "Checking installed titles...");
+
+    s32 next = 0;
+    bool stop = false;
+    u64 last_draw = 0;
+    while (ctrl && m) {
+        // keep every lane busy
+        for (int k = 0; k < LANES && next < n && !stop; k++)
+            while (lanes[k].st == St_Idle && next < n)
+                lane_start(m, &p, &lanes[k], ids[next++], ctrl, from_scratch);
+        int busy = 0;
+        for (int k = 0; k < LANES; k++) busy += lanes[k].st != St_Idle;
+        if (!busy) break;
+
+        int running = 0;
+        curl_multi_perform(m, &running);
+        CURLMsg *msg;
+        int left;
+        while ((msg = curl_multi_info_read(m, &left))) {
+            if (msg->msg != CURLMSG_DONE) continue;
+            Lane *l = NULL;
+            curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE, (char **)&l);
+            if (l) lane_done(m, &p, l, msg->data.result);
+        }
+        curl_multi_poll(m, NULL, 0, 30, NULL);
+
+        padUpdate(pad);
+        if (padGetButtonsDown(pad) & HidNpadButton_B) {
+            for (int k = 0; k < LANES; k++) lane_abort(m, &lanes[k]);
+            job_line(j, "\x1b[33m", "Stopped.");
+            stop = true;
+            break;
+        }
+        u64 now = armGetSystemTick();
+        if (now - last_draw > armNsToTicks(100000000ULL)) {  // ~10 times a second
+            draw_icons(j, false);
+            last_draw = now;
+        }
+    }
+    curl_multi_cleanup(m);
     free(ctrl);
-    json_object_put(eshop);
-    json_object_put(uploads);
-    json_object_put(checked);
+    free(ids);
+    json_object_put(p.eshop);
+    json_object_put(p.uploads);
+    json_object_put(p.checked);
     nsExit();
 
-    int fresh = j->total - j->skipped;
-    if (fresh == 0)
-        job_line(j, "\x1b[32m", "All %d titles have working icons - nothing to do.", j->total);
+    int fresh = j->found + j->uploaded + j->failed;
+    if (fresh == 0 && !stop)
+        job_line(j, "\x1b[32m", "All %d titles already have their icons - nothing new to do.", j->total);
     else
-        job_line(j, "\x1b[1m", "Done: %d prepared (%d uploaded, %d found, %d broken links redone), "
-                 "%d already fine, %d to retry later.",
-                 fresh, j->uploaded, j->found, j->repaired, j->skipped, j->failed);
+        job_line(j, "\x1b[1m", "Done: %d found, %d uploaded, %d already fine, %d to retry later.",
+                 j->found, j->uploaded, j->skipped, j->failed);
     if (j->failed == 0 && fresh > 0)
         job_line(j, "", "The module uses these right away (no reboot needed).");
 }
