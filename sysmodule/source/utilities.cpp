@@ -821,6 +821,68 @@ Result get_app_tid(AppInfo *info) {
 	return 0;
 }
 
+// --- game names (start) ---------------------------------------------------
+//
+// A title's name comes from its control data (NACP), one entry per language.
+// Some titles ship a stray byte or a lone punctuation mark in a language slot
+// (Graveyard Keeper 2 was read as "‚"). The console-language lookup returned
+// it as the name, and a broken byte even makes Discord refuse the whole
+// status. So an entry only counts as a name when it is valid UTF-8 and has at
+// least one letter or digit in it.
+
+// Letters and digits of the scripts a title name can be in.
+static bool isLetterLike(u32 c) {
+	return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+	       (c >= 0xC0 && c <= 0x24F && c != 0xD7 && c != 0xF7) ||  // Latin-1 / Latin Extended
+	       (c >= 0x370 && c <= 0x52F) ||                           // Greek, Cyrillic
+	       (c >= 0x590 && c <= 0x6FF) ||                           // Hebrew, Arabic
+	       (c >= 0xE00 && c <= 0xE7F) ||                           // Thai
+	       (c >= 0x1E00 && c <= 0x1FFF) ||                         // Latin / Greek extended
+	       (c >= 0x3040 && c <= 0x30FF) ||                         // Hiragana, Katakana
+	       (c >= 0x3400 && c <= 0x4DBF) || (c >= 0x4E00 && c <= 0x9FFF) ||  // CJK
+	       (c >= 0xAC00 && c <= 0xD7AF) ||                         // Hangul
+	       (c >= 0xFF10 && c <= 0xFF19) || (c >= 0xFF21 && c <= 0xFF3A) ||
+	       (c >= 0xFF41 && c <= 0xFF5A) || (c >= 0xFF66 && c <= 0xFF9F);  // full / half width
+}
+
+// Number of letters and digits in a string of at most `max` bytes, or -1 when
+// it isn't valid UTF-8.
+static int countLetters(const char* s, size_t max) {
+	const unsigned char* p = (const unsigned char*)s;
+	const unsigned char* end = p + max;
+	int letters = 0;
+	while (p < end && *p) {
+		u32 c = *p++;
+		int extra = 0;
+		if (c >= 0x80) {
+			if (c >= 0xC2 && c <= 0xDF)      { extra = 1; c &= 0x1F; }
+			else if (c >= 0xE0 && c <= 0xEF) { extra = 2; c &= 0x0F; }
+			else if (c >= 0xF0 && c <= 0xF4) { extra = 3; c &= 0x07; }
+			else return -1;
+		}
+		for (int i = 0; i < extra; i++, p++) {
+			if (p >= end || (*p & 0xC0) != 0x80) return -1;
+			c = (c << 6) | (*p & 0x3F);
+		}
+		if ((extra == 2 && c < 0x800) || (extra == 3 && (c < 0x10000 || c > 0x10FFFF)) ||
+		    (c >= 0xD800 && c <= 0xDFFF))
+			return -1;  // overlong, out of range or a surrogate
+		if (isLetterLike(c)) letters++;
+	}
+	return letters;
+}
+
+static void logRejectedName(int slot, const char* name) {
+	char hex[3 * 8 + 1] = {0};
+	for (int i = 0; i < 8 && name[i]; i++)
+		snprintf(hex + i * 3, 4, "%02X ", (unsigned char)name[i]);
+	if (slot < 0)
+		writeToLog("[SwitchRPC] Skipping an unusable name in the console language slot (bytes: %s)", hex);
+	else
+		writeToLog("[SwitchRPC] Skipping an unusable name in language slot %d (bytes: %s)", slot, hex);
+}
+// --- game names (end) -----------------------------------------------------
+
 Result get_app_info(AppInfo *info) {
 	u64 *out_tid = &info->tid;
 	
@@ -837,15 +899,23 @@ Result get_app_info(AppInfo *info) {
     Result res = MAKERESULT(Module_Libnx, LibnxError_NotFound);
 	if (R_SUCCEEDED(nsGetApplicationControlData(NsApplicationControlSource_Storage, *out_tid, appControlData, appControlDataSize, &appControlDataSize))) {
 		const char* name = NULL;
-		if (R_SUCCEEDED(nacpGetLanguageEntry(&appControlData->nacp, &languageEntry)) && languageEntry != NULL && languageEntry->name[0]) {
-			name = languageEntry->name;
-		} else {
-			// no entry for the console language - take the first one that has a name
-			for (int i = 0; i < 16 && !name; i++) {
-				if (appControlData->nacp.lang[i].name[0])
-					name = appControlData->nacp.lang[i].name;
+		const char* plain = NULL;  // valid text without letters/digits: only if nothing better exists
+		if (R_FAILED(nacpGetLanguageEntry(&appControlData->nacp, &languageEntry)))
+			languageEntry = NULL;
+		// the console language first, then the slots in order (English comes
+		// first); the first entry that is a usable name wins
+		for (int k = -1; k < 16 && !name; k++) {
+			const NacpLanguageEntry* e = k < 0 ? languageEntry : &appControlData->nacp.lang[k];
+			if (!e || !e->name[0]) continue;
+			int letters = countLetters(e->name, sizeof(e->name));
+			if (letters > 0) {
+				name = e->name;
+			} else {
+				logRejectedName(k, e->name);
+				if (letters == 0 && !plain) plain = e->name;
 			}
 		}
+		if (!name) name = plain;
 		if (name) {
 			strncpy(info->title_name, name, sizeof(info->title_name) - 1);
 			info->title_name[sizeof(info->title_name) - 1] = '\0';
