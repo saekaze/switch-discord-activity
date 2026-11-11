@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- **Games whose name showed up as a single odd character** (Graveyard Keeper 2 appeared as `‚` and its status didn't work right). A title's name is stored once per language, and some games ship a stray byte or a lone punctuation mark in one of those slots. The module used whatever the console-language slot held. It now only accepts a name that is valid text with at least one letter or digit, and otherwise tries English and then the other languages. Rejected entries are written to the log (with their first bytes), so a title that still looks wrong can be diagnosed.
+
 ## [1.1.7] - 2026-10-29
 
 ### Fixed
