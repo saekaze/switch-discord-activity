@@ -24,6 +24,7 @@
 #include <json-c/json.h>
 #include <json-c/json_util.h>
 #include "config.h"
+#include "nacp_name.h"
 #include "qrcodegen.h"
 #include "ui.h"
 #include "update.h"
@@ -574,6 +575,21 @@ static void save_settings(const bool *v, Lang lang) {
     settings_save(v, lang == Lang_Ja ? 1 : 0);
 }
 
+// the console's language as a NACP language slot, for titles' names
+static int console_name_slot(void) {
+    static int slot = -2;
+    if (slot != -2) return slot;
+    slot = -1;
+    u64 code = 0;
+    SetLanguage l;
+    if (R_SUCCEEDED(setInitialize())) {
+        if (R_SUCCEEDED(setGetSystemLanguage(&code)))
+            slot = nacp_slot_for_language(R_SUCCEEDED(setMakeLanguage(code, &l)) ? (int)l : -1, code);
+        setExit();
+    }
+    return slot;
+}
+
 static Lang console_lang(void) {
     u64 code = 0;
     SetLanguage l;
@@ -1101,9 +1117,10 @@ static bool lane_start(CURLM *m, Prep *p, Lane *l, u64 id, NsApplicationControlD
     u64 actual = 0;
     snprintf(l->name, sizeof(l->name), "?");
     if (R_SUCCEEDED(nsGetApplicationControlData(NsApplicationControlSource_Storage, id, ctrl, sizeof(*ctrl), &actual))) {
-        NacpLanguageEntry *le = NULL;
-        if (R_SUCCEEDED(nacpGetLanguageEntry(&ctrl->nacp, &le)) && le && le->name[0])
-            snprintf(l->name, sizeof(l->name), "%.*s", (int)ui_text_fit(le->name, 30, false), le->name);
+        char name[0x201];
+        // handles the compressed names of 21.0.0+ titles too (nacp_name.h)
+        if (nacp_title_name(&ctrl->nacp, console_name_slot(), name, sizeof(name)))
+            snprintf(l->name, sizeof(l->name), "%.*s", (int)ui_text_fit(name, 30, false), name);
         if (actual > sizeof(ctrl->nacp)) {
             l->icon_len = actual - sizeof(ctrl->nacp);
             l->icon = malloc(l->icon_len);

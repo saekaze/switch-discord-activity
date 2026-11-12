@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.1.9] - 2026-11-12
+
+### Fixed
+- **Games released for firmware 21.0.0 and later showed a strange character ("‚") in 1.1.7 or their title ID in 1.1.8 instead of their name** (Graveyard Keeper 2). These games store their names compressed, which libnx doesn't read yet, so the compressed bytes were taken for the name. The module and the app now unpack them (and pick the console's language from them, including the new Polish and Thai).
+
 ## [1.1.8] - 2026-11-11
 
 ### Fixed
