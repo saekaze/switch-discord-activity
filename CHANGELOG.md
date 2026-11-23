@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.10] - 2026-11-23
+
+### Fixed
+- **The module turned itself off a second after starting, every time the console was online** (issue #5). It keeps a small file of its Discord statuses (`sdmc:/config/switchrpc_sessions`) to delete them later. That file grew with every new status (every HOME press) and was only trimmed now and then, and the module read it whole into its 512 KB of memory - once the file was big enough, or damaged, reading it ran out of memory and the module quit, before it could ever trim it. It's now read in small pieces and only its end, damaged lines are skipped and the file rewritten, and a status is crossed off as soon as Discord confirms it's deleted, so the file stays a few lines long. If you deleted the file to get going again, nothing else is needed.
+- If the module ever runs out of memory again, the log now says so instead of just "Goodbye!".
+- **Diagnostics said "Module on the SD card - copy atmosphere/ to the SD root" when the module was installed but turned off in ovl-sysmodules.** It now tells the two apart: "Not started at boot - turned off in ovl-sysmodules?".
+
 ## [1.1.9] - 2026-11-12
 
 ### Fixed

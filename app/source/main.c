@@ -365,7 +365,7 @@ typedef enum { Screen_Main, Screen_Login, Screen_Test, Screen_IconsAsk, Screen_I
 
 typedef struct {
     char fw[32], ams[32];
-    bool on_sd, running, logged_in, online;
+    bool on_sd, at_boot, running, logged_in, online;
     char user[64];
     char launch[80];       // result of the last "start module" attempt
     const char *status_color;
@@ -485,7 +485,10 @@ static void read_status(Diag *d) {
 }
 
 static void diag_refresh(Diag *d, bool have_pm) {
-    d->on_sd = file_exists(MODULE_DIR "/exefs.nsp") && access(MODULE_DIR "/flags/boot2.flag", F_OK) == 0;
+    // separate checks: turning the module off in ovl-sysmodules removes only
+    // the boot flag, and that used to read as "not installed"
+    d->on_sd = file_exists(MODULE_DIR "/exefs.nsp");
+    d->at_boot = access(MODULE_DIR "/flags/boot2.flag", F_OK) == 0;
     read_log(d);
     read_status(d);  // overrides the log-based guess when present
     d->running = (have_pm && sysmodule_running()) || d->status_fresh;
@@ -550,6 +553,8 @@ static int diag_lines(const Diag *d, const char **out) {
 #define L(...) do { if (n < DIAG_LINES) { snprintf(diag_buf[n], sizeof(diag_buf[0]), __VA_ARGS__); out[n] = diag_buf[n]; n++; } } while (0)
     L("Switch Discord Activity v" SWITCHRPC_VERSION "   firmware %s   Atmosphere %s", d->fw, d->ams);
     L("%s Module on the SD card%s", mark(d->on_sd), d->on_sd ? "" : " - copy atmosphere/ to the SD root");
+    if (d->on_sd && !d->at_boot)
+        L("\x1b[33m[ -- ]\x1b[0m Not started at boot - turned off in ovl-sysmodules? Turn it on there");
     L("%s Module running%s", mark(d->running), d->running ? "" : " - press Y to start it");
     if (d->launch[0]) L("       Start module: %s", d->launch);
     L("%s Logged in to Discord%s%s", d->logged_in ? mark(true) : "\x1b[33m[ -- ]\x1b[0m",

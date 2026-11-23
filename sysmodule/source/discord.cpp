@@ -7,6 +7,8 @@
 #include <string>
 #include <time.h>
 #include <set>
+#include <vector>
+#include <algorithm>
 #include <fstream>
 
 #include <switch.h>
@@ -87,15 +89,102 @@ void saveRefreshTokenToFile() {
     writeToLog("[Discord] Successfully saved new refresh token to file");
 }
 
-void saveSessionTokenToFile(const std::string& token) {
-    std::ofstream file("sdmc:/config/switchrpc_sessions", std::ios::app);
-    if (!file.is_open()) {
-        writeToLog("[Discord] Failed to open sdmc:/config/switchrpc_sessions for appending!");
+// --- switchrpc_sessions: tokens of statuses that may still be on Discord ---
+//
+// Every new status gets a session token, and Discord keeps the status until
+// it's deleted with that token, so they're written down here. The module has
+// a 512 KB heap: this file used to be read whole and only trimmed during a
+// cleanup, so it could grow (a new token per HOME press) or get damaged until
+// reading it ran out of memory - the module then quit a second after start,
+// at every start (issue #5). Now it's read with a fixed buffer, only its end,
+// garbage is skipped, and a token leaves the file as soon as its status is
+// confirmed gone.
+
+#define SESSIONS_PATH       "sdmc:/config/switchrpc_sessions"
+#define SESSIONS_MAX_TOKENS 32            // a few are ever live; keep the newest
+#define SESSIONS_MAX_BYTES  (64 * 1024)   // read no more than the end of a big file
+#define TOKEN_MAX_LEN       2048
+
+static bool tokenLooksValid(const char* s, size_t n) {
+    if (n < 8 || n > TOKEN_MAX_LEN) return false;
+    for (size_t i = 0; i < n; i++)
+        if (s[i] < 0x21 || s[i] > 0x7E) return false;  // printable, no spaces
+    return true;
+}
+
+// The saved tokens, oldest first. *damaged = the file had something else in it.
+static std::vector<std::string> readSessionTokens(bool* damaged) {
+    std::vector<std::string> tokens;
+    *damaged = false;
+    FILE* f = fopen(SESSIONS_PATH, "rb");
+    if (!f) return tokens;
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    long start = size > SESSIONS_MAX_BYTES ? size - SESSIONS_MAX_BYTES : 0;
+    if (start > 0) *damaged = true;  // that big is never normal
+    fseek(f, start, SEEK_SET);
+
+    static char line[TOKEN_MAX_LEN + 3];
+    bool skipping = start > 0;  // reading from the middle: the first line is cut
+    while (fgets(line, sizeof(line), f)) {
+        size_t n = strlen(line);
+        bool eol = n > 0 && line[n - 1] == '\n';
+        if (skipping) {
+            if (eol) skipping = false;
+            continue;
+        }
+        if (!eol && !feof(f)) {  // longer than any token: skip the rest of it
+            *damaged = true;
+            skipping = true;
+            continue;
+        }
+        while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = '\0';
+        if (n == 0) continue;
+        if (!tokenLooksValid(line, n)) {
+            *damaged = true;
+            continue;
+        }
+        std::string t(line, n);
+        tokens.erase(std::remove(tokens.begin(), tokens.end(), t), tokens.end());
+        tokens.push_back(t);
+        if (tokens.size() > SESSIONS_MAX_TOKENS) tokens.erase(tokens.begin());
+    }
+    fclose(f);
+    return tokens;
+}
+
+static void writeSessionTokens(const std::vector<std::string>& tokens) {
+    if (tokens.empty()) {
+        remove(SESSIONS_PATH);
         return;
     }
-    file << token << std::endl;
-    file.close();
-    writeToLog("[Discord] Appended new session token to file");
+    FILE* f = fopen(SESSIONS_PATH, "wb");
+    if (!f) {
+        writeToLog("[Discord] Can't write " SESSIONS_PATH);
+        return;
+    }
+    for (const std::string& t : tokens) fprintf(f, "%s\n", t.c_str());
+    fclose(f);
+}
+
+void saveSessionTokenToFile(const std::string& token) {
+    bool damaged;
+    std::vector<std::string> tokens = readSessionTokens(&damaged);
+    if (damaged) writeToLog("[Discord] " SESSIONS_PATH " had damaged lines, rewriting it.");
+    tokens.erase(std::remove(tokens.begin(), tokens.end(), token), tokens.end());
+    tokens.push_back(token);
+    if (tokens.size() > SESSIONS_MAX_TOKENS) tokens.erase(tokens.begin());
+    writeSessionTokens(tokens);
+    writeToLog("[Discord] Saved the new session token (%d in the file).", (int)tokens.size());
+}
+
+// its status is gone from Discord: no need to remember it
+static void forgetSessionToken(const std::string& token) {
+    bool damaged;
+    std::vector<std::string> tokens = readSessionTokens(&damaged);
+    size_t before = tokens.size();
+    tokens.erase(std::remove(tokens.begin(), tokens.end(), token), tokens.end());
+    if (tokens.size() != before || damaged) writeSessionTokens(tokens);
 }
 
 int curlDebugCallback(CURL *handle, curl_infotype type, char *data, size_t size, void *userp) {
@@ -365,61 +454,43 @@ static bool deleteSessionToken(const std::string& token) {
         authTokenExpiry = 0;  // forces a refresh
     }
     json_object_put(json_body);
-    return ok || g_lastHttpCode == 404 || g_lastHttpCode == 400;
+    bool gone = ok || g_lastHttpCode == 404 || g_lastHttpCode == 400;
+    if (gone) forgetSessionToken(token);
+    return gone;
 }
 
 void discordCleanupStaleSessions() {
-    std::ifstream file("sdmc:/config/switchrpc_sessions");
-    if (!file.is_open()) {
-        writeToLog("[Discord] No stale sessions file found. Skipping cleanup.");
+    bool damaged;
+    std::vector<std::string> tokens = readSessionTokens(&damaged);
+    if (damaged) writeToLog("[Discord] " SESSIONS_PATH " had damaged lines, skipped them.");
+    if (tokens.empty()) {
+        if (damaged) remove(SESSIONS_PATH);
+        writeToLog("[Discord] No stale sessions to clean up.");
         return;
     }
+    writeToLog("[Discord] Cleaning up %d stale session(s)...", (int)tokens.size());
 
-    writeToLog("[Discord] Found switchrpc_sessions file, cleaning up stale sessions...");
-    
-    std::set<std::string> uniqueTokens;
-    std::string line;
-    
-    while (std::getline(file, line)) {
-        if (!line.empty() && line.back() == '\r') {
-            line.pop_back();
-        }
-        if (!line.empty()) {
-            uniqueTokens.insert(line);
-        }
-    }
-    file.close();
-
-    if (!sessionToken.empty() && uniqueTokens.count(sessionToken) > 0) {
-        if ((time_t)getCorrectedNowSec() < sessionTokenExpiry) {
-            uniqueTokens.erase(sessionToken);
-        }
-    }
-    
-    std::set<std::string> failed;  // kept for the next cleanup
+    // the live status stays, unless it's past its refresh time
+    bool keepCurrent = !sessionToken.empty() && (time_t)getCorrectedNowSec() < sessionTokenExpiry;
+    std::vector<std::string> kept;  // for the next cleanup
     bool currentGone = false;
-    for (const std::string& token : uniqueTokens) {
+    for (const std::string& token : tokens) {
+        if (keepCurrent && token == sessionToken) continue;
         writeToLog("[Discord] Deleting stale headless session...");
-        // keep it unless it's really gone (offline, login refused, Discord down...)
+        // kept unless it's really gone (offline, login refused, Discord down...)
         bool gone = deleteSessionToken(token);
-        if (!gone && failed.size() < 50)
-            failed.insert(token);
-        if (gone && token == sessionToken)
-            currentGone = true;
+        if (!gone) kept.push_back(token);
+        if (gone && token == sessionToken) currentGone = true;
     }
 
     // rewrite the list: what couldn't be deleted, plus the session that's live
-    // right now - it used to be dropped here, so if deleting it failed later
-    // (offline at sleep / shutdown / logout) nothing remembered it and the
-    // status stayed on Discord
-    remove("sdmc:/config/switchrpc_sessions");
-    if (!sessionToken.empty() && !currentGone)
-        failed.insert(sessionToken);
-    if (!failed.empty()) {
-        std::ofstream out("sdmc:/config/switchrpc_sessions", std::ios::trunc);
-        for (const std::string& t : failed) out << t << std::endl;
-    }
-    writeToLog("[Discord] Stale sessions cleaned up (%d kept for later).", (int)failed.size());
+    // right now - if deleting it fails later (offline at sleep / shutdown /
+    // logout), it must still be remembered or its status stays on Discord
+    if (!sessionToken.empty() && !currentGone &&
+        std::find(kept.begin(), kept.end(), sessionToken) == kept.end())
+        kept.push_back(sessionToken);
+    writeSessionTokens(kept);
+    writeToLog("[Discord] Stale sessions cleaned up (%d kept for later).", (int)kept.size());
 }
 
 // Buttons in headless sessions aren't documented: try the RPC shape first,

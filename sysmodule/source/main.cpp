@@ -5,6 +5,7 @@
 #include <time.h>
 #include <string>
 #include <map>
+#include <new>
 #include <sys/stat.h>
 
 // Include the main libnx system header, for Switch development
@@ -245,8 +246,17 @@ static void finishAppUpdate() {
     }
 }
 
+// The module has a fixed 512 KB heap and no exceptions: running out of memory
+// ends it on the spot. Say so in the log instead of a silent "Goodbye".
+static void outOfMemory() {
+    std::set_new_handler(nullptr);
+    writeToLog("[SwitchRPC] Out of memory - the module has to stop. Please report this with this log.");
+    abort();
+}
+
 int main(int argc, char* argv[])
 {
+    std::set_new_handler(outOfMemory);
     writeToLog("[SwitchRPC] Sysmodule v%s started successfully.", SWITCHRPC_VERSION);
     mkdir("sdmc:/config", 0777);
     finishAppUpdate();
